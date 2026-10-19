@@ -1,0 +1,22 @@
+[Unit]
+Description=Kirppari-Kalle MQTT monitor
+After=network.target
+
+[Service]
+Type=simple
+User=kirpparikalle
+Group=kirpparikalle
+WorkingDirectory=/opt/kirpparikalle
+
+EnvironmentFile=/etc/kirpparikalle.env
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/kirpparikalle/ms-playwright
+
+ExecStart=/opt/kirpparikalle/venv/bin/python /opt/kirpparikalle/kk_mqtt.py
+
+Restart=on-failure
+RestartSec=300
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

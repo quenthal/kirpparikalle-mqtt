@@ -1,0 +1,25 @@
+# Secrets and runtime state
+.env
+*.env
+auth.json
+kirpparikalle_state.json
+monitor_state.json
+*_state.json
+
+# Python environments and Playwright browsers
+.venv/
+venv/
+ms-playwright/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Logs and editor files
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,8 @@
+type: entities
+title: Kirppari-Kalle
+entities:
+  - entity: sensor.kirppari_kalle_saldo
+  - entity: sensor.kirppari_kalle_myytyja_tuotteita
+  - entity: sensor.kirppari_kalle_myynti_alkaa
+  - entity: sensor.kirppari_kalle_myynti_paattyy
+  - entity: sensor.kirppari_kalle_tarkistettu
