@@ -2,11 +2,12 @@
 """
 Kirppari-Kalle -> MQTT -> Home Assistant monitor.
 
-Version 1.2.0
+Version 1.2.1
 
 - Reuses a Playwright storage_state file for authentication.
 - Reads reservations and opening hours at startup and around 08:00 / 20:00.
-- Reads sales every 5 minutes only while a reservation is active and the shop is open.
+- Reads sales every 5 minutes only while a reservation is active and the shop is open,
+  plus one final read after closing time.
 - Waits 5 seconds for the animated balance to settle.
 - Publishes retained current state and non-retained change events to MQTT.
 - Publishes Home Assistant MQTT Discovery entities.
@@ -29,7 +30,7 @@ import paho.mqtt.client as mqtt
 from playwright.sync_api import Page, sync_playwright
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 TZ = ZoneInfo("Europe/Helsinki")
 
 DATA_DIR = Path(os.getenv("KK_DATA_DIR", "/var/lib/kirpparikalle"))
@@ -52,8 +53,10 @@ SALES_URL = (
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))
 SALES_SETTLE_MS = int(os.getenv("SALES_SETTLE_MS", "5000"))
+FINAL_READ_DELAY_MINUTES = int(os.getenv("FINAL_READ_DELAY_MINUTES", "10"))
+MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "6"))
 
-MQTT_HOST = os.getenv("MQTT_HOST", "192.168.1.10")
+MQTT_HOST = os.getenv("MQTT_HOST", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USER = os.getenv("MQTT_USER", "mqtt")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
@@ -65,6 +68,7 @@ MQTT_STATUS_TOPIC = os.getenv("MQTT_STATUS_TOPIC", "kirpparikalle/status")
 MQTT_RESERVATION_TOPIC = os.getenv(
     "MQTT_RESERVATION_TOPIC", "kirpparikalle/reservation"
 )
+MQTT_AUTH_TOPIC = os.getenv("MQTT_AUTH_TOPIC", "kirpparikalle/auth")
 
 HA_DISCOVERY_PREFIX = os.getenv("HA_DISCOVERY_PREFIX", "homeassistant")
 HA_DEVICE_ID = os.getenv("HA_DEVICE_ID", "kirpparikalle_monitor")
@@ -79,7 +83,17 @@ WEEKDAYS = {
     "perjantai": 4,
     "lauantai": 5,
     "sunnuntai": 6,
+    "ma": 0,
+    "ti": 1,
+    "ke": 2,
+    "to": 3,
+    "pe": 4,
+    "la": 5,
+    "su": 6,
 }
+
+# Longest names first so that "maanantai" is not matched as "ma".
+WEEKDAY_PATTERN = "|".join(sorted(WEEKDAYS, key=len, reverse=True))
 
 STOP_EVENT = threading.Event()
 
@@ -113,7 +127,7 @@ def parse_reservations(text: str) -> list[tuple[date, date]]:
 
 
 def parse_clock(value: str) -> dt_time:
-    value = value.strip()
+    value = value.strip().replace(".", ":")
     if ":" in value:
         return datetime.strptime(value, "%H:%M").time()
     return dt_time(int(value), 0)
@@ -144,11 +158,8 @@ def parse_opening_hours(text: str) -> dict[int, tuple[dt_time, dt_time] | None]:
             continue
 
         match = re.match(
-            r"^(maanantai|tiistai|keskiviikko|torstai|"
-            r"perjantai|lauantai|sunnuntai)"
-            r"(?:\s*[-–]\s*"
-            r"(maanantai|tiistai|keskiviikko|torstai|"
-            r"perjantai|lauantai|sunnuntai))?"
+            rf"^({WEEKDAY_PATTERN})\b"
+            rf"(?:\s*[-–]\s*({WEEKDAY_PATTERN})\b)?"
             r"\s*:\s*(.+)$",
             line,
         )
@@ -167,9 +178,9 @@ def parse_opening_hours(text: str) -> dict[int, tuple[dt_time, dt_time] | None]:
             continue
 
         time_match = re.search(
-            r"(\d{1,2}(?::\d{2})?)"
+            r"(\d{1,2}(?:[:.]\d{2})?)"
             r"\s*[-–]\s*"
-            r"(\d{1,2}(?::\d{2})?)",
+            r"(\d{1,2}(?:[:.]\d{2})?)",
             value,
         )
 
@@ -264,6 +275,25 @@ def is_open(
     current = now.time().replace(second=0, microsecond=0)
 
     return opening <= current < closing
+
+
+def final_read_due(
+    opening_hours: dict[int, tuple[dt_time, dt_time] | None],
+    now: datetime,
+    done_for: date | None,
+) -> bool:
+    """
+    True once per open day after closing time (+ delay), so that sales made
+    during the last poll interval before closing are not missed.
+    """
+    hours = opening_hours.get(now.weekday())
+    if hours is None or done_for == now.date():
+        return False
+
+    _, closing = hours
+    closing_dt = datetime.combine(now.date(), closing, tzinfo=TZ)
+
+    return now >= closing_dt + timedelta(minutes=FINAL_READ_DELAY_MINUTES)
 
 
 def next_metadata_refresh(now: datetime) -> datetime:
@@ -542,6 +572,19 @@ def publish_home_assistant_discovery(client: mqtt.Client) -> None:
             "state_topic": MQTT_UPDATE_TOPIC,
             "event_types": ["sales_update"],
         },
+        # No availability: the service exits when the login has expired,
+        # and the problem must stay visible while it is offline.
+        f"{HA_DISCOVERY_PREFIX}/binary_sensor/{HA_DEVICE_ID}/auth/config": {
+            "device": ha_device(),
+            "origin": origin,
+            "name": "Kirjautuminen vanhentunut",
+            "unique_id": "kirpparikalle_auth_expired",
+            "state_topic": MQTT_AUTH_TOPIC,
+            "payload_on": "expired",
+            "payload_off": "ok",
+            "device_class": "problem",
+            "entity_category": "diagnostic",
+        },
     }
 
     for topic, payload in discoveries.items():
@@ -604,13 +647,12 @@ def republish_saved_state(client: mqtt.Client) -> None:
     logging.info("Tallennettu MQTT state julkaistu uudelleen")
 
 
-def publish_reservation_state(
-    client: mqtt.Client,
+def build_reservation_payload(
     shop: str,
     reservations: list[tuple[date, date]],
     opening_hours: dict[int, tuple[dt_time, dt_time] | None],
     now: datetime,
-) -> None:
+) -> dict:
     reservation = relevant_reservation(
         reservations,
         opening_hours,
@@ -628,7 +670,7 @@ def publish_reservation_state(
         and start_dt <= now < end_dt
     )
 
-    payload = {
+    return {
         "shop": shop,
         "reservation_start": start_dt.isoformat() if start_dt else "",
         "reservation_end": end_dt.isoformat() if end_dt else "",
@@ -636,12 +678,20 @@ def publish_reservation_state(
         "updated_at": now.isoformat(),
     }
 
-    mqtt_publish_json(
-        client,
-        MQTT_RESERVATION_TOPIC,
-        payload,
-        retain=True,
-    )
+
+def reservation_payload_changed(old: dict | None, new: dict) -> bool:
+    """Compare reservation payloads ignoring the updated_at timestamp."""
+    if old is None:
+        return True
+
+    return {k: v for k, v in old.items() if k != "updated_at"} != {
+        k: v for k, v in new.items() if k != "updated_at"
+    }
+
+
+def publish_auth_state(client: mqtt.Client, state: str) -> None:
+    info = client.publish(MQTT_AUTH_TOPIC, state, qos=1, retain=True)
+    info.wait_for_publish(timeout=10)
 
 
 def make_mqtt_client() -> mqtt.Client:
@@ -728,6 +778,11 @@ def refresh_metadata(
         reservation_text
     )
 
+    if not reservations:
+        logging.warning(
+            "Varauksia ei löytynyt myreservations-sivulta"
+        )
+
     company_text = get_page_text(
         page,
         COMPANY_URL,
@@ -736,6 +791,12 @@ def refresh_metadata(
     opening_hours = parse_opening_hours(
         company_text
     )
+
+    if not any(opening_hours.values()):
+        logging.warning(
+            "Aukioloaikoja ei löytynyt companydetails-sivulta; "
+            "myyntejä ei lueta"
+        )
 
     shop = "Kirppari-Kalle"
 
@@ -935,6 +996,11 @@ def main() -> int:
         handle_stop_signal,
     )
 
+    if not MQTT_HOST:
+        logging.error("MQTT_HOST puuttuu asetuksista")
+
+        return 1
+
     if not AUTH_STATE_FILE.exists():
         logging.error(
             "Kirjautumistiedostoa ei löydy: %s",
@@ -979,6 +1045,10 @@ def main() -> int:
             ] = {}
 
             next_meta_refresh: datetime | None = None
+            reservation_payload: dict | None = None
+            auth_state: str | None = None
+            final_read_done_for: date | None = None
+            consecutive_failures = 0
 
             while not STOP_EVENT.is_set():
                 try:
@@ -999,13 +1069,12 @@ def main() -> int:
                             path=str(AUTH_STATE_FILE)
                         )
 
-                        publish_reservation_state(
-                            mqtt_client,
-                            shop,
-                            reservations,
-                            opening_hours,
-                            now,
-                        )
+                        if auth_state != "ok":
+                            publish_auth_state(mqtt_client, "ok")
+                            auth_state = "ok"
+
+                        # Force a publish so updated_at stays fresh.
+                        reservation_payload = None
 
                         next_meta_refresh = (
                             next_metadata_refresh(now)
@@ -1022,6 +1091,25 @@ def main() -> int:
                             ),
                         )
 
+                    new_reservation_payload = build_reservation_payload(
+                        shop,
+                        reservations,
+                        opening_hours,
+                        now,
+                    )
+
+                    if reservation_payload_changed(
+                        reservation_payload,
+                        new_reservation_payload,
+                    ):
+                        mqtt_publish_json(
+                            mqtt_client,
+                            MQTT_RESERVATION_TOPIC,
+                            new_reservation_payload,
+                            retain=True,
+                        )
+                        reservation_payload = new_reservation_payload
+
                     active = find_active_reservation(
                         reservations,
                         now.date(),
@@ -1032,10 +1120,20 @@ def main() -> int:
                         now,
                     )
 
-                    if active and open_now:
+                    final_read = bool(
+                        active
+                        and not open_now
+                        and final_read_due(
+                            opening_hours,
+                            now,
+                            final_read_done_for,
+                        )
+                    )
+
+                    if active and (open_now or final_read):
                         logging.info(
-                            "Active reservation and "
-                            "shop open -> reading sales"
+                            "Active reservation and %s -> reading sales",
+                            "shop open" if open_now else "final read after closing",
                         )
 
                         balance, sales = read_sales(
@@ -1055,6 +1153,9 @@ def main() -> int:
                             now,
                         )
 
+                        if final_read:
+                            final_read_done_for = now.date()
+
                     else:
                         logging.info(
                             "No sales read: "
@@ -1063,14 +1164,34 @@ def main() -> int:
                             "yes" if open_now else "no",
                         )
 
+                    consecutive_failures = 0
+
                 except AuthExpired as exc:
                     logging.error("%s", exc)
+
+                    try:
+                        publish_auth_state(mqtt_client, "expired")
+                    except Exception:
+                        logging.exception("Auth-tilan julkaisu epäonnistui")
+
                     return 2
 
                 except Exception:
+                    consecutive_failures += 1
+
                     logging.exception(
-                        "Monitoring cycle failed"
+                        "Monitoring cycle failed (%d/%d)",
+                        consecutive_failures,
+                        MAX_CONSECUTIVE_FAILURES,
                     )
+
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        logging.error(
+                            "Liian monta peräkkäistä virhettä, "
+                            "lopetetaan (systemd käynnistää uudelleen)"
+                        )
+
+                        return 1
 
                 STOP_EVENT.wait(POLL_SECONDS)
 

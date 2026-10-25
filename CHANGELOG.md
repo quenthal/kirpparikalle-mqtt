@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.1
+
+- Aukioloajat: tuki pistemuotoisille kellonajoille (`10.00-18.00`, aiemmin tulkittiin
+  00:00–18:00) ja lyhennetyille viikonpäiville (`Ti-Pe`).
+- Lopullinen myyntiluku `FINAL_READ_DELAY_MINUTES` (oletus 10) minuuttia sulkemisen
+  jälkeen; viimeisen pollausvälin myynnit eivät enää jää lukematta.
+- `kirpparikalle/reservation` julkaistaan aina sisällön muuttuessa, ei vain klo 08/20
+  (`reservation_active` ja jakson päättyminen päivittyvät heti).
+- Uusi retained `kirpparikalle/auth` (`ok`/`expired`) ja Home Assistantin
+  ongelma-anturi vanhentuneelle kirjautumiselle + esimerkkiautomaatio.
+- Ohjelma lopettaa `MAX_CONSECUTIVE_FAILURES` (oletus 6) peräkkäisen epäonnistuneen
+  syklin jälkeen, jotta systemd käynnistää sen (ja selaimen) uudelleen.
+- Varoitus lokiin, jos varauksia tai aukioloaikoja ei löydy.
+- `MQTT_HOST` on pakollinen asetus (ei enää oletusosoitetta).
+- Esimerkeistä poistettu ympäristökohtaiset tiedot; README:n update-esimerkkiin
+  lisätty `observed_at`.
+
 ## 1.2.0
 
 - Home Assistant MQTT Discovery:

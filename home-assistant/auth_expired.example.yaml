@@ -1,0 +1,17 @@
+alias: Kirppari-Kalle - kirjautuminen vanhentunut
+description: Ilmoittaa, kun Kirppari-Kallen auth.json pitää luoda uudelleen
+
+triggers:
+  - trigger: mqtt
+    topic: kirpparikalle/auth
+    payload: expired
+
+actions:
+  - action: notify.notify
+    data:
+      message: >-
+        Kirppari-Kalle-kirjautuminen on vanhentunut. Luo uusi
+        kirpparikalle_state.json, kopioi se auth.json-tiedostoksi
+        ja käynnistä palvelu uudelleen.
+
+mode: single

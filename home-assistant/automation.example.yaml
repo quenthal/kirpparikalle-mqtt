@@ -12,10 +12,8 @@ conditions:
          and (trigger.payload_json.new_sales | default([]) | count) > 0 }}
 
 actions:
-  - action: notify.koti
+  - action: notify.notify
     data:
-      target:
-        - '1081101269571207170'
       message: >-
         {% set p = trigger.payload_json %}
         Kirppari-Kalle: saldo {{ "%.2f"|format(p.balance | float) }} €
