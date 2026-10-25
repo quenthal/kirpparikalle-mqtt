@@ -13,13 +13,14 @@ Discoveryn avulla.
 
 ## Nykyinen versio
 
-`1.2.0`
+`1.2.1`
 
 Tähän versioon on koottu projektissa käytössä olleet korjaukset ja viimeisimmät
 sovitut lisäykset:
 
 - myyntitarkistus 5 minuutin välein
 - myyntisivu haetaan vain aktiivisen varauksen ja aukioloajan aikana
+- yksi lopullinen myyntiluku sulkemisajan jälkeen
 - saldo luetaan vasta 5 sekunnin animaatio-odotuksen jälkeen
 - uusien myyntien tunnistus
 - retained nykytila
@@ -28,6 +29,7 @@ sovitut lisäykset:
 - myyntijakson alku- ja loppuaikasensorit
 - metadatahaku käynnistyksessä sekä klo 08 ja 20
 - Proxmox LXC:lle sopiva systemd-palvelu
+- vanhentunut kirjautuminen näkyy Home Assistantissa ongelma-anturina
 
 ## Arkkitehtuuri
 
@@ -40,7 +42,7 @@ kk_mqtt.py (Proxmox LXC)
       |
       | MQTT
       v
-MQTT broker 192.168.1.10:1883
+MQTT broker (MQTT_HOST:1883)
       |
       +--> Home Assistant
       +--> MQTT Explorer
@@ -76,6 +78,13 @@ käynnistys
           vertaa edelliseen
 ```
 
+Kun varaus on voimassa, myynnit luetaan vielä kerran noin
+`FINAL_READ_DELAY_MINUTES` (oletus 10) minuuttia sulkemisajan jälkeen, jotta
+viimeisen 5 minuutin myynnit eivät jää huomaamatta.
+
+Jos `MAX_CONSECUTIVE_FAILURES` (oletus 6) sykliä peräkkäin epäonnistuu,
+ohjelma lopettaa ja systemd käynnistää sen uudelleen.
+
 Varaus- ja aukiolotiedot päivitetään lisäksi klo 08 ja klo 20 Suomen ajassa.
 
 ## MQTT-topicit
@@ -86,12 +95,13 @@ Varaus- ja aukiolotiedot päivitetään lisäksi klo 08 ja klo 20 Suomen ajassa.
 | `kirpparikalle/state` | kyllä | saldo, myyty määrä, tarkistusaika |
 | `kirpparikalle/update` | ei | vain oikea myyntimuutos |
 | `kirpparikalle/reservation` | kyllä | myyntijakson alku/loppu |
+| `kirpparikalle/auth` | kyllä | `ok` / `expired` |
 
 Esimerkki `kirpparikalle/state`:
 
 ```json
 {
-  "shop": "Tapanilan kirppis",
+  "shop": "Esimerkkikirppis",
   "balance": 16.0,
   "sold_count": 3,
   "reservation": {
@@ -107,7 +117,8 @@ Esimerkki `kirpparikalle/update`:
 ```json
 {
   "event_type": "sales_update",
-  "shop": "Tapanilan kirppis",
+  "shop": "Esimerkkikirppis",
+  "observed_at": "2026-10-03T12:01:29+03:00",
   "previous_balance": 16.0,
   "balance": 24.0,
   "balance_change": 8.0,
@@ -130,7 +141,7 @@ Esimerkki `kirpparikalle/reservation`:
 
 ```json
 {
-  "shop": "Tapanilan kirppis",
+  "shop": "Esimerkkikirppis",
   "reservation_start": "2026-10-03T10:00:00+03:00",
   "reservation_end": "2026-10-10T16:00:00+03:00",
   "reservation_active": true,
@@ -139,6 +150,8 @@ Esimerkki `kirpparikalle/reservation`:
 ```
 
 Varauspäivämäärät yhdistetään kirpputorin todellisiin aukioloaikoihin.
+`reservation` julkaistaan aina kun sen sisältö muuttuu (esim. `reservation_active`
+myyntijakson alkaessa ja päättyessä) sekä jokaisen metadatahaun yhteydessä.
 
 ## Home Assistant
 
@@ -150,6 +163,7 @@ MQTT Discovery luo saman Kirppari-Kalle-laitteen alle:
 - `sensor.kirppari_kalle_myynti_alkaa`
 - `sensor.kirppari_kalle_myynti_paattyy`
 - `event.kirppari_kalle_myyntimuutos`
+- `binary_sensor.kirppari_kalle_kirjautuminen_vanhentunut`
 
 Home Assistant voi nimetä entity-ID:t hieman eri tavalla, jos samalla nimellä on jo
 olemassa entiteettejä.
@@ -170,6 +184,7 @@ kirpparikalle-mqtt/
 │   └── create_auth_state.py
 ├── home-assistant/
 │   ├── automation.example.yaml
+│   ├── auth_expired.example.yaml
 │   └── lovelace.example.yaml
 ├── tests/
 │   └── test_parsers.py
@@ -257,7 +272,7 @@ git config --global --add safe.directory /opt/kirpparikalle
 Tietty versio otetaan käyttöön tagilla, esimerkiksi:
 
 ```bash
-git -C /opt/kirpparikalle checkout v1.2.0
+git -C /opt/kirpparikalle checkout v1.2.1
 ```
 
 `venv/` ja `ms-playwright/` luodaan saman hakemiston alle, mutta `.gitignore`
@@ -315,7 +330,7 @@ nano /etc/kirpparikalle.env
 Nykyisessä ympäristössä broker on:
 
 ```ini
-MQTT_HOST=192.168.1.10
+MQTT_HOST=<brokerin osoite>
 MQTT_PORT=1883
 MQTT_USER=mqtt
 MQTT_PASSWORD=<oma salasana>
@@ -385,9 +400,9 @@ Onnistuneessa käynnistyksessä:
 
 ```text
 MQTT connected
-Home Assistant MQTT Discovery julkaistu (6 entiteettiä)
+Home Assistant MQTT Discovery julkaistu (7 entiteettiä)
 Tallennettu MQTT state julkaistu uudelleen
-Metadata refreshed: Tapanilan kirppis, reservations 1. Next refresh: ...
+Metadata refreshed: Esimerkkikirppis, reservations 1. Next refresh: ...
 ```
 
 Kun kirppis on auki ja varaus voimassa:
@@ -412,7 +427,7 @@ apt install -y mosquitto-clients
 
 ```bash
 mosquitto_sub \
-  -h 192.168.1.10 \
+  -h <MQTT_HOST> \
   -p 1883 \
   -u mqtt \
   -P '<salasana>' \
@@ -424,7 +439,7 @@ Discovery:
 
 ```bash
 mosquitto_sub \
-  -h 192.168.1.10 \
+  -h <MQTT_HOST> \
   -p 1883 \
   -u mqtt \
   -P '<salasana>' \
@@ -443,10 +458,10 @@ home-assistant/automation.example.yaml
 Se käyttää:
 
 ```text
-notify.koti
+notify.notify
 ```
 
-ja projektissa käytettyä targetia.
+Vaihda tilalle oma notify-palvelu ja tarvittaessa `target`.
 
 Automaatio kuuntelee suoraan:
 
@@ -455,6 +470,12 @@ kirpparikalle/update
 ```
 
 Sensorien entity-ID:t eivät siis vaikuta ilmoituksen toimintaan.
+
+Kirjautumisen vanhenemisesta ilmoittaa vastaavasti:
+
+```text
+home-assistant/auth_expired.example.yaml
+```
 
 ## 12. Lovelace
 
@@ -495,7 +516,11 @@ tapahtua muutaman minuutin tavoiteajan jälkeen.
 
 ## 15. Kirjautumisen vanheneminen
 
-Jos Kirppari-Kalle palauttaa kirjautumissivun, ohjelma lopettaa ajon virhekoodilla.
+Jos Kirppari-Kalle palauttaa kirjautumissivun, ohjelma julkaisee
+`kirpparikalle/auth` = `expired` ja lopettaa ajon virhekoodilla. Home Assistantissa
+anturi `binary_sensor.kirppari_kalle_kirjautuminen_vanhentunut` menee tilaan
+*ongelma*; sen varaan voi tehdä ilmoitusautomaation. Anturilla ei ole
+availability-sidosta, joten tila näkyy myös palvelun ollessa pysähdyksissä.
 Systemd yrittää käynnistää sen uudelleen viiden minuutin kuluttua.
 
 Jos istunto on oikeasti vanhentunut:
@@ -577,7 +602,7 @@ Tai tietty versio:
 
 ```bash
 git -C /opt/kirpparikalle fetch --tags
-git -C /opt/kirpparikalle checkout v1.2.0
+git -C /opt/kirpparikalle checkout v1.2.1
 ```
 
 ### C. Riippuvuudet, oikeudet ja systemd
