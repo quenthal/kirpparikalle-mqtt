@@ -13,7 +13,7 @@ Discoveryn avulla.
 
 ## Nykyinen versio
 
-`1.2.1`
+`1.2.2`
 
 Tähän versioon on koottu projektissa käytössä olleet korjaukset ja viimeisimmät
 sovitut lisäykset:
@@ -30,6 +30,8 @@ sovitut lisäykset:
 - metadatahaku käynnistyksessä sekä klo 08 ja 20
 - Proxmox LXC:lle sopiva systemd-palvelu
 - vanhentunut kirjautuminen näkyy Home Assistantissa ongelma-anturina
+- istunnon ylläpitohaku tunnin välein
+- valinnainen automaattinen uudelleenkirjautuminen
 
 ## Arkkitehtuuri
 
@@ -272,7 +274,7 @@ git config --global --add safe.directory /opt/kirpparikalle
 Tietty versio otetaan käyttöön tagilla, esimerkiksi:
 
 ```bash
-git -C /opt/kirpparikalle checkout v1.2.1
+git -C /opt/kirpparikalle checkout v1.2.2
 ```
 
 `venv/` ja `ms-playwright/` luodaan saman hakemiston alle, mutta `.gitignore`
@@ -514,6 +516,9 @@ Varaus- ja aukiolotiedot haetaan:
 Pääsilmukka herää 5 minuutin välein, joten kellonaikapäivitys voi käytännössä
 tapahtua muutaman minuutin tavoiteajan jälkeen.
 
+Lisäksi istuntoa pidetään yllä kevyellä sivulatauksella, jos mitään sivua ei ole
+haettu `KEEPALIVE_MINUTES` (oletus 60) minuuttiin. `0` poistaa ylläpitohaun.
+
 ## 15. Kirjautumisen vanheneminen
 
 Jos Kirppari-Kalle palauttaa kirjautumissivun, ohjelma julkaisee
@@ -523,7 +528,30 @@ anturi `binary_sensor.kirppari_kalle_kirjautuminen_vanhentunut` menee tilaan
 availability-sidosta, joten tila näkyy myös palvelun ollessa pysähdyksissä.
 Systemd yrittää käynnistää sen uudelleen viiden minuutin kuluttua.
 
-Jos istunto on oikeasti vanhentunut:
+### Automaattinen uudelleenkirjautuminen (valinnainen)
+
+Kun `/etc/kirpparikalle.env`:ssä on tunnukset, ohjelma kirjautuu vanhentuneen
+istunnon tilalle itse samalla tavalla kuin käyttäjä selaimessa ja tallentaa uuden
+istunnon `auth.json`:iin:
+
+```ini
+KK_USERNAME=<käyttäjätunnus>
+KK_PASSWORD=<salasana>
+# Vain jos tunnuksella on useita kirpputoreja (osa nimestä riittää):
+KK_SHOP=<kirpputorin nimi>
+# Yrityksiä enintään kerran tässä ajassa (tunnuksen lukittumisen esto):
+RELOGIN_MIN_INTERVAL_HOURS=6
+```
+
+Tunnuksilla `auth.json`:ia ei tarvita edes ensimmäisellä käynnistyksellä. Jos
+kirjautuminen epäonnistuu (väärä salasana, sivuston muutos), toiminta on sama
+kuin ilman tunnuksia: `expired`-tila ja ilmoitus Home Assistantiin. Salasanaa ei
+kirjoiteta lokiin. Käytä Kirppari-Kalleen salasanaa, jota et käytä muualla, ja
+pidä env-tiedosto vain rootin luettavana (`chmod 600`).
+
+### Käsin
+
+Jos istunto on oikeasti vanhentunut eikä automaattinen kirjautuminen ole käytössä:
 
 1. luo uusi `kirpparikalle_state.json`
 2. kopioi se `/var/lib/kirpparikalle/auth.json`
@@ -556,6 +584,7 @@ Kirppari-Kalleen.
 - `kirpparikalle_state.json`
 - `monitor_state.json`
 - oikeaa MQTT-salasanaa
+- Kirppari-Kallen tunnuksia (`KK_USERNAME`, `KK_PASSWORD`)
 
 `.gitignore` sisältää näille tavallisimmat suojaukset.
 
@@ -602,7 +631,7 @@ Tai tietty versio:
 
 ```bash
 git -C /opt/kirpparikalle fetch --tags
-git -C /opt/kirpparikalle checkout v1.2.1
+git -C /opt/kirpparikalle checkout v1.2.2
 ```
 
 ### C. Riippuvuudet, oikeudet ja systemd

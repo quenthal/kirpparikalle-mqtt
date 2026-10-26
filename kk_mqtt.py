@@ -2,12 +2,14 @@
 """
 Kirppari-Kalle -> MQTT -> Home Assistant monitor.
 
-Version 1.2.1
+Version 1.2.2
 
 - Reuses a Playwright storage_state file for authentication.
 - Reads reservations and opening hours at startup and around 08:00 / 20:00.
 - Reads sales every 5 minutes only while a reservation is active and the shop is open,
   plus one final read after closing time.
+- Keeps the session alive with a light page load (default every 60 minutes).
+- Optionally logs in again automatically when the session has expired.
 - Waits 5 seconds for the animated balance to settle.
 - Publishes retained current state and non-retained change events to MQTT.
 - Publishes Home Assistant MQTT Discovery entities.
@@ -30,7 +32,7 @@ import paho.mqtt.client as mqtt
 from playwright.sync_api import Page, sync_playwright
 
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 TZ = ZoneInfo("Europe/Helsinki")
 
 DATA_DIR = Path(os.getenv("KK_DATA_DIR", "/var/lib/kirpparikalle"))
@@ -40,6 +42,7 @@ AUTH_STATE_FILE = Path(
 MONITOR_STATE_FILE = Path(
     os.getenv("KK_MONITOR_STATE_FILE", str(DATA_DIR / "monitor_state.json"))
 )
+RELOGIN_STATE_FILE = DATA_DIR / "last_login_attempt"
 
 RESERVATIONS_URL = (
     "https://www.kirpparikalle.net/sovellus/index.php?page=myreservations"
@@ -50,11 +53,22 @@ COMPANY_URL = (
 SALES_URL = (
     "https://www.kirpparikalle.net/sovellus/index.php?page=mysales"
 )
+LOGIN_URL = (
+    "https://www.kirpparikalle.net/sovellus/guest.php?page=login"
+)
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))
 SALES_SETTLE_MS = int(os.getenv("SALES_SETTLE_MS", "5000"))
 FINAL_READ_DELAY_MINUTES = int(os.getenv("FINAL_READ_DELAY_MINUTES", "10"))
 MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "6"))
+KEEPALIVE_MINUTES = int(os.getenv("KEEPALIVE_MINUTES", "60"))
+
+# Automatic re-login (optional). Without credentials an expired session
+# only raises the auth problem sensor, as before.
+KK_USERNAME = os.getenv("KK_USERNAME", "")
+KK_PASSWORD = os.getenv("KK_PASSWORD", "")
+KK_SHOP = os.getenv("KK_SHOP", "")
+RELOGIN_MIN_INTERVAL_HOURS = float(os.getenv("RELOGIN_MIN_INTERVAL_HOURS", "6"))
 
 MQTT_HOST = os.getenv("MQTT_HOST", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -100,6 +114,10 @@ STOP_EVENT = threading.Event()
 
 class AuthExpired(RuntimeError):
     """Kirppari-Kalle session is no longer authenticated."""
+
+
+class LoginFailed(RuntimeError):
+    """Automatic login did not succeed."""
 
 
 def handle_stop_signal(signum, frame):
@@ -296,6 +314,54 @@ def final_read_due(
     return now >= closing_dt + timedelta(minutes=FINAL_READ_DELAY_MINUTES)
 
 
+def keepalive_due(last_activity: datetime | None, now: datetime) -> bool:
+    if KEEPALIVE_MINUTES <= 0 or last_activity is None:
+        return False
+    return now - last_activity >= timedelta(minutes=KEEPALIVE_MINUTES)
+
+
+def relogin_allowed(last_attempt: datetime | None, now: datetime) -> bool:
+    """Credentials are set and the previous attempt is old enough."""
+    if not (KK_USERNAME and KK_PASSWORD):
+        return False
+    if last_attempt is None:
+        return True
+    return now - last_attempt >= timedelta(hours=RELOGIN_MIN_INTERVAL_HOURS)
+
+
+def choose_shop_option(names: list[str], wanted: str) -> int:
+    """Index of the shop to pick on the login page's shop list."""
+    if wanted:
+        matches = [
+            i for i, name in enumerate(names)
+            if wanted.casefold() in name.casefold()
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        raise LoginFailed(
+            f"KK_SHOP vastaa {len(matches)} kirpputoria ({len(names)} vaihtoehtoa)"
+        )
+    if len(names) == 1:
+        return 0
+    raise LoginFailed(
+        f"Tunnuksella on {len(names)} kirpputoria; aseta KK_SHOP"
+    )
+
+
+def load_last_login_attempt() -> datetime | None:
+    try:
+        return datetime.fromisoformat(
+            RELOGIN_STATE_FILE.read_text(encoding="utf-8").strip()
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def save_last_login_attempt(when: datetime) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    RELOGIN_STATE_FILE.write_text(when.isoformat(), encoding="utf-8")
+
+
 def next_metadata_refresh(now: datetime) -> datetime:
     """Return the next local metadata refresh time: 08:00 or 20:00."""
     for hour in METADATA_REFRESH_HOURS:
@@ -339,6 +405,44 @@ def get_page_text(page: Page, url: str) -> str:
         )
 
     return text
+
+
+def login(page: Page) -> None:
+    """
+    Log in with KK_USERNAME / KK_PASSWORD like a user would, choosing the
+    shop when the account has several. Never logs the credentials.
+    """
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+    page.fill("#username", KK_USERNAME)
+    page.fill("#password", KK_PASSWORD)
+    page.click('input[type="submit"][value="Kirjaudu"]')
+
+    chosen = False
+    for _ in range(60):
+        page.wait_for_timeout(500)
+
+        if "guest.php" not in page.url:
+            break
+
+        try:
+            options = page.locator(".login_company_option")
+            count = options.count()
+        except Exception:
+            # The page is navigating.
+            continue
+
+        if count and not chosen:
+            names = [options.nth(i).inner_text().strip() for i in range(count)]
+            options.nth(choose_shop_option(names, KK_SHOP)).click()
+            chosen = True
+    else:
+        raise LoginFailed(
+            "Kirjautuminen ei edennyt 30 sekunnissa "
+            "(väärä tunnus/salasana tai sivu muuttunut)"
+        )
+
+    # Verify with a real page; raises AuthExpired if still logged out.
+    get_page_text(page, RESERVATIONS_URL)
 
 
 def parse_balance(text: str) -> float:
@@ -1001,9 +1105,9 @@ def main() -> int:
 
         return 1
 
-    if not AUTH_STATE_FILE.exists():
+    if not AUTH_STATE_FILE.exists() and not (KK_USERNAME and KK_PASSWORD):
         logging.error(
-            "Kirjautumistiedostoa ei löydy: %s",
+            "Kirjautumistiedostoa ei löydy: %s (eikä KK_USERNAME/KK_PASSWORD)",
             AUTH_STATE_FILE,
         )
 
@@ -1028,7 +1132,9 @@ def main() -> int:
             )
 
             context = browser.new_context(
-                storage_state=str(AUTH_STATE_FILE),
+                storage_state=(
+                    str(AUTH_STATE_FILE) if AUTH_STATE_FILE.exists() else None
+                ),
                 timezone_id="Europe/Helsinki",
             )
 
@@ -1048,6 +1154,7 @@ def main() -> int:
             reservation_payload: dict | None = None
             auth_state: str | None = None
             final_read_done_for: date | None = None
+            last_activity: datetime | None = None
             consecutive_failures = 0
 
             while not STOP_EVENT.is_set():
@@ -1068,6 +1175,8 @@ def main() -> int:
                         context.storage_state(
                             path=str(AUTH_STATE_FILE)
                         )
+
+                        last_activity = now
 
                         if auth_state != "ok":
                             publish_auth_state(mqtt_client, "ok")
@@ -1090,6 +1199,14 @@ def main() -> int:
                                 "%d.%m.%Y %H:%M"
                             ),
                         )
+
+                    elif keepalive_due(last_activity, now):
+                        get_page_text(page, RESERVATIONS_URL)
+                        context.storage_state(
+                            path=str(AUTH_STATE_FILE)
+                        )
+                        last_activity = now
+                        logging.info("Keepalive ok")
 
                     new_reservation_payload = build_reservation_payload(
                         shop,
@@ -1143,6 +1260,7 @@ def main() -> int:
                         context.storage_state(
                             path=str(AUTH_STATE_FILE)
                         )
+                        last_activity = now
 
                         process_sales_change(
                             mqtt_client,
@@ -1168,6 +1286,41 @@ def main() -> int:
 
                 except AuthExpired as exc:
                     logging.error("%s", exc)
+
+                    attempt_at = datetime.now(TZ)
+
+                    if relogin_allowed(load_last_login_attempt(), attempt_at):
+                        logging.info("Yritetään automaattista uudelleenkirjautumista")
+                        save_last_login_attempt(attempt_at)
+
+                        try:
+                            login(page)
+                            context.storage_state(
+                                path=str(AUTH_STATE_FILE)
+                            )
+                        except (LoginFailed, AuthExpired) as login_exc:
+                            logging.error(
+                                "Automaattinen kirjautuminen epäonnistui: %s",
+                                login_exc,
+                            )
+                        except Exception as login_exc:
+                            # Playwright messages are not logged in full.
+                            logging.error(
+                                "Automaattinen kirjautuminen epäonnistui: %s",
+                                type(login_exc).__name__,
+                            )
+                        else:
+                            logging.info("Automaattinen kirjautuminen onnistui")
+                            last_activity = attempt_at
+                            next_meta_refresh = None
+                            continue
+
+                    elif KK_USERNAME and KK_PASSWORD:
+                        logging.info(
+                            "Automaattista kirjautumista yritetty alle %s h sitten; "
+                            "ei yritetä nyt",
+                            f"{RELOGIN_MIN_INTERVAL_HOURS:g}",
+                        )
 
                     try:
                         publish_auth_state(mqtt_client, "expired")

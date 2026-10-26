@@ -1,8 +1,14 @@
 import unittest
-from datetime import date, datetime, time
+from unittest import mock
+from datetime import date, datetime, time, timedelta
 
+import kk_mqtt
 from kk_mqtt import (
     TZ,
+    LoginFailed,
+    choose_shop_option,
+    keepalive_due,
+    relogin_allowed,
     build_reservation_payload,
     final_read_due,
     next_metadata_refresh,
@@ -217,6 +223,129 @@ class ParserTests(unittest.TestCase):
 
         self.assertFalse(after["reservation_active"])
         self.assertEqual(after["reservation_start"], "")
+
+
+class SessionTests(unittest.TestCase):
+    NOW = datetime(2026, 10, 26, 12, 0, tzinfo=TZ)
+
+    def test_keepalive_due(self):
+        with mock.patch.object(kk_mqtt, "KEEPALIVE_MINUTES", 60):
+            self.assertFalse(keepalive_due(None, self.NOW))
+            self.assertFalse(keepalive_due(self.NOW - timedelta(minutes=59), self.NOW))
+            self.assertTrue(keepalive_due(self.NOW - timedelta(minutes=60), self.NOW))
+
+        with mock.patch.object(kk_mqtt, "KEEPALIVE_MINUTES", 0):
+            self.assertFalse(keepalive_due(self.NOW - timedelta(days=1), self.NOW))
+
+    def test_relogin_allowed(self):
+        with mock.patch.multiple(
+            kk_mqtt, KK_USERNAME="", KK_PASSWORD="", RELOGIN_MIN_INTERVAL_HOURS=6
+        ):
+            self.assertFalse(relogin_allowed(None, self.NOW))
+
+        with mock.patch.multiple(
+            kk_mqtt, KK_USERNAME="u", KK_PASSWORD="p", RELOGIN_MIN_INTERVAL_HOURS=6
+        ):
+            self.assertTrue(relogin_allowed(None, self.NOW))
+            self.assertFalse(relogin_allowed(self.NOW - timedelta(hours=5), self.NOW))
+            self.assertTrue(relogin_allowed(self.NOW - timedelta(hours=6), self.NOW))
+
+    def test_choose_shop_option(self):
+        names = ["Kirppis A", "Kirppis B"]
+
+        self.assertEqual(choose_shop_option(["Ainoa"], ""), 0)
+        self.assertEqual(choose_shop_option(names, "kirppis b"), 1)
+
+        with self.assertRaises(LoginFailed):
+            choose_shop_option(names, "")
+        with self.assertRaises(LoginFailed):
+            choose_shop_option(names, "kirppis")
+        with self.assertRaises(LoginFailed):
+            choose_shop_option(names, "C")
+
+
+class FakeOptions:
+    def __init__(self, page):
+        self.page = page
+
+    def count(self):
+        return len(self.page.shops) if self.page.show_shops else 0
+
+    def nth(self, i):
+        page = self.page
+
+        class Option:
+            def inner_text(self):
+                return page.shops[i]
+
+            def click(self):
+                page.clicked.append(page.shops[i])
+                page.url = "https://example.invalid/sovellus/index.php"
+
+        return Option()
+
+
+class FakeLoginPage:
+    """Mimics the login page: form -> (shop list ->) index.php."""
+
+    def __init__(self, shops, accept=True):
+        self.url = ""
+        self.shops = shops
+        self.accept = accept
+        self.show_shops = False
+        self.filled = {}
+        self.clicked = []
+
+    def goto(self, url, **kwargs):
+        self.url = "https://example.invalid/sovellus/guest.php?page=login"
+
+    def fill(self, selector, value):
+        self.filled[selector] = value
+
+    def click(self, selector):
+        if not self.accept:
+            return
+        if len(self.shops) > 1:
+            self.show_shops = True
+        else:
+            self.url = "https://example.invalid/sovellus/index.php"
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def locator(self, selector):
+        assert selector == ".login_company_option"
+        return FakeOptions(self)
+
+
+class LoginFlowTests(unittest.TestCase):
+    def run_login(self, page, shop=""):
+        with mock.patch.multiple(
+            kk_mqtt, KK_USERNAME="user", KK_PASSWORD="secret", KK_SHOP=shop
+        ), mock.patch.object(kk_mqtt, "get_page_text") as verify:
+            kk_mqtt.login(page)
+        verify.assert_called_once()
+
+    def test_single_shop_redirects(self):
+        page = FakeLoginPage(["Ainoa"])
+        self.run_login(page)
+        self.assertEqual(page.filled, {"#username": "user", "#password": "secret"})
+        self.assertIn("index.php", page.url)
+
+    def test_shop_is_chosen_by_name(self):
+        page = FakeLoginPage(["Kirppis A", "Kirppis B"])
+        self.run_login(page, shop="kirppis b")
+        self.assertEqual(page.clicked, ["Kirppis B"])
+
+    def test_rejected_login_fails(self):
+        page = FakeLoginPage(["Ainoa"], accept=False)
+        with self.assertRaises(LoginFailed):
+            self.run_login(page)
+
+    def test_ambiguous_shop_fails(self):
+        page = FakeLoginPage(["Kirppis A", "Kirppis B"])
+        with self.assertRaises(LoginFailed):
+            self.run_login(page)
 
 
 if __name__ == "__main__":
