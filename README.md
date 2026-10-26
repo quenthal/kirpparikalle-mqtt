@@ -6,9 +6,19 @@ Palvelu kirjautuu Kirppari-Kalleen ja lukee valitun kirpputorin aktiiviset
 varaukset, aukioloajat, myyntisaldon ja myydyt tuotteet. Tiedot julkaistaan
 MQTT:hen, ja Home Assistant löytää sensorit automaattisesti MQTT Discoveryn avulla.
 
-> Tämä on epävirallinen integraatio. Se lukee Kirppari-Kallen web-käyttöliittymää
-> tavallisilla HTTP-pyynnöillä eikä käytä virallista API:a. Sivuston rakenteen
-> muutos voi vaatia parserien päivittämistä.
+> **Ei virallinen.** Tämä on yksityishenkilön tekemä, epävirallinen työkalu. Sillä ei
+> ole mitään yhteyttä Kirppari-Kalleen tai palvelun omistajaan, eikä Kirppari-Kalle ole
+> tehnyt, hyväksynyt, tukenut tai tarkastanut sitä. Työkalu lukee Kirppari-Kallen
+> web-käyttöliittymää käyttäjän omilla tunnuksilla tavallisilla HTTP-pyynnöillä eikä
+> käytä virallista rajapintaa; palvelun muutokset voivat rikkoa sen milloin tahansa.
+> Käyttö omalla vastuulla. Älä ota yhteyttä Kirppari-Kallen asiakaspalveluun tätä
+> työkalua koskevissa asioissa – käytä tämän repon issueita.
+>
+> Kirppari-Kalle-nimi on omistajansa tavaramerkki, ja sitä käytetään ainoastaan
+> osoittamaan, mihin palveluun työkalu liittyy.
+>
+> *Unofficial tool by a private individual; not affiliated with, endorsed or supported
+> by Kirppari-Kalle or its owner.*
 
 ## Nykyinen versio
 
