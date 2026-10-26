@@ -4,6 +4,8 @@
 auth.json
 kirpparikalle_state.json
 monitor_state.json
+session.cookies
+last_login_attempt.json
 *_state.json
 
 # Python environments and Playwright browsers

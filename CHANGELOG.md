@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.0.0
+
+- **Ei selainta**: Playwright ja Chromium poistettu. Kirppari-Kallea luetaan
+  tavallisilla HTTP-pyynnöillä (Pythonin vakiokirjasto); ainoa riippuvuus on
+  `paho-mqtt`.
+- Kirjautuminen tunnuksilla (`KK_USERNAME`, `KK_PASSWORD`, tarvittaessa `KK_SHOP`)
+  samoilla kutsuilla kuin kirjautumissivu; istunto evästetiedostossa
+  `session.cookies`. Ilman tunnuksia 1.x:n `auth.json`-istunto otetaan käyttöön.
+- Uudelleenkirjautumisen tahti: epäonnistuneen jälkeen `RELOGIN_MIN_INTERVAL_HOURS`
+  (6 h), onnistuneen jälkeen vähintään 10 min.
+- Saldo luetaan sivun piilokentästä tarkkana arvona; 5 s animaatio-odotus
+  (`SALES_SETTLE_MS`) poistettu.
+- Myyntitaulu luetaan HTML-taulukosta sarakeotsikoiden perusteella; avaimet
+  yhteensopivat 1.x:n kanssa (ei vääriä "uusia myyntejä" päivityksessä).
+  Myyntien summaa verrataan saldoon, poikkeamasta varoitus lokiin.
+- Uusi sensori "Tiedot päivitetty" (`data_updated_at`, Kirppari-Kallen oma aika).
+- systemd: `PLAYWRIGHT_BROWSERS_PATH` poistettu.
+
+## 1.2.2 (ei julkaistu erikseen)
+
+- Istunnon ylläpitohaku: kevyt sivulataus, jos mitään sivua ei ole haettu
+  `KEEPALIVE_MINUTES` (oletus 60) minuuttiin. 1.2.1 haki varausten ulkopuolella
+  vain klo 08 ja 20, mikä jätti istunnon 12 tunniksi käyttämättä.
+- Valinnainen automaattinen uudelleenkirjautuminen (`KK_USERNAME`, `KK_PASSWORD`,
+  tarvittaessa `KK_SHOP`); enintään yksi yritys `RELOGIN_MIN_INTERVAL_HOURS`
+  (oletus 6) tunnissa. Epäonnistuessa toiminta kuten ennen (`expired`).
+- Tunnusten kanssa `auth.json` ei ole pakollinen käynnistyksessä.
+
 ## 1.2.1
 
 - Aukioloajat: tuki pistemuotoisille kellonajoille (`10.00-18.00`, aiemmin tulkittiin

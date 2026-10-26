@@ -6,3 +6,5 @@ entities:
   - entity: sensor.kirppari_kalle_myynti_alkaa
   - entity: sensor.kirppari_kalle_myynti_paattyy
   - entity: sensor.kirppari_kalle_tarkistettu
+  - entity: sensor.kirppari_kalle_tiedot_paivitetty
+  - entity: binary_sensor.kirppari_kalle_kirjautuminen_vanhentunut

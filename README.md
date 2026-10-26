@@ -1,98 +1,102 @@
 # Kirppari-Kalle MQTT
 
-Kirppari-Kalle-myyntiseuranta Proxmox LXC:lle.
+Kirppari-Kalle-myyntiseuranta Home Assistantille MQTT:n kautta.
 
-Palvelu lukee kirjautuneesta Kirppari-Kalle-istunnosta aktiiviset varaukset,
-valitun kirpputorin aukioloajat, myyntisaldon ja myydyt tuotteet. Tiedot
-julkaistaan MQTT:hen ja Home Assistant löytää sensorit automaattisesti MQTT
-Discoveryn avulla.
+Palvelu kirjautuu Kirppari-Kalleen ja lukee valitun kirpputorin aktiiviset
+varaukset, aukioloajat, myyntisaldon ja myydyt tuotteet. Tiedot julkaistaan
+MQTT:hen, ja Home Assistant löytää sensorit automaattisesti MQTT Discoveryn avulla.
 
-> Tämä on epävirallinen integraatio. Se käyttää Kirppari-Kallen web-käyttöliittymää
-> Playwrightilla eikä virallista API:a. Sivuston HTML-rakenteen muutos voi vaatia
-> parserien päivittämistä.
+> Tämä on epävirallinen integraatio. Se lukee Kirppari-Kallen web-käyttöliittymää
+> tavallisilla HTTP-pyynnöillä eikä käytä virallista API:a. Sivuston rakenteen
+> muutos voi vaatia parserien päivittämistä.
 
 ## Nykyinen versio
 
-`1.2.1`
+`2.0.0`
 
-Tähän versioon on koottu projektissa käytössä olleet korjaukset ja viimeisimmät
-sovitut lisäykset:
-
-- myyntitarkistus 5 minuutin välein
-- myyntisivu haetaan vain aktiivisen varauksen ja aukioloajan aikana
-- yksi lopullinen myyntiluku sulkemisajan jälkeen
-- saldo luetaan vasta 5 sekunnin animaatio-odotuksen jälkeen
-- uusien myyntien tunnistus
-- retained nykytila
-- ei-retained myyntimuutostapahtuma
-- Home Assistant MQTT Discovery
-- myyntijakson alku- ja loppuaikasensorit
-- metadatahaku käynnistyksessä sekä klo 08 ja 20
-- Proxmox LXC:lle sopiva systemd-palvelu
-- vanhentunut kirjautuminen näkyy Home Assistantissa ongelma-anturina
+- pelkkä HTTP Pythonin vakiokirjastolla – ei selainta, ei Playwrightia
+- kirjautuminen tunnuksilla, istunto säilyy evästetiedostossa, automaattinen
+  uudelleenkirjautuminen
+- tarkka saldo sivun piilokentästä (ei animaatio-odotusta)
+- myyntitarkistus 5 minuutin välein aktiivisen varauksen ja aukioloajan aikana
+  sekä kerran sulkemisajan jälkeen
+- uusien myyntien tunnistus, retained nykytila, ei-retained muutostapahtuma
+- Home Assistant MQTT Discovery (8 entiteettiä)
+- istunnon ylläpitohaku tunnin välein
+- vanhentunut/epäonnistunut kirjautuminen näkyy Home Assistantissa ongelma-anturina
 
 ## Arkkitehtuuri
 
 ```text
-Kirppari-Kalle
+Kirppari-Kalle (www.kirpparikalle.net)
       |
-      | HTTPS / Playwright storage_state
+      | HTTPS (kirjautuminen + sivut, evästetiedosto)
       v
-kk_mqtt.py (Proxmox LXC)
+kk_mqtt.py (esim. Proxmox LXC + systemd)
       |
       | MQTT
       v
-MQTT broker (MQTT_HOST:1883)
-      |
-      +--> Home Assistant
-      +--> MQTT Explorer
+MQTT broker  --> Home Assistant
 ```
+
+Ainoa ulkoinen riippuvuus on `paho-mqtt` (ja `tzdata`).
 
 ## Toimintalogiikka
 
 ```text
 käynnistys
-   |
-   +--> MQTT-yhteys
-   +--> Home Assistant Discovery
-   +--> varaukset + aukioloajat
-   +--> reservation MQTT state
-   |
+   +--> MQTT-yhteys, Home Assistant Discovery, tallennetun tilan uudelleenjulkaisu
+   +--> istunto evästetiedostosta (tai kirjautuminen tunnuksilla)
+   +--> varaukset + aukioloajat -> reservation-topic
    v
 5 minuutin sykli
-   |
-   +--> onko aktiivinen varaus?
-   |       ei -> ei mysales-hakua
-   |
-   +--> onko kirppis auki?
-           ei -> ei mysales-hakua
-           kyllä
-             |
-             v
-          mysales
-             |
-          odota 5 s
-             |
-          saldo + tuotteet
-             |
-          vertaa edelliseen
+   +--> varaus voimassa ja kirppis auki (tai sulkemisen jälkeinen loppuluku)?
+   |       kyllä -> mysales: saldo + tuotteet -> vertaa edelliseen
+   +--> muuten tarvittaessa ylläpitohaku (KEEPALIVE_MINUTES)
 ```
 
-Kun varaus on voimassa, myynnit luetaan vielä kerran noin
-`FINAL_READ_DELAY_MINUTES` (oletus 10) minuuttia sulkemisajan jälkeen, jotta
-viimeisen 5 minuutin myynnit eivät jää huomaamatta.
+- Varaus- ja aukiolotiedot päivitetään käynnistyksessä sekä klo 08 ja 20 Suomen ajassa.
+- Kun varaus on voimassa, myynnit luetaan vielä kerran noin
+  `FINAL_READ_DELAY_MINUTES` (oletus 10) minuuttia sulkemisajan jälkeen.
+- Jos `MAX_CONSECUTIVE_FAILURES` (oletus 6) sykliä peräkkäin epäonnistuu, ohjelma
+  lopettaa ja systemd käynnistää sen uudelleen.
+- Myyntisivun luvun jälkeen tarkistetaan, että myytyjen tuotteiden summa vastaa
+  saldoa; poikkeamasta tulee lokiin varoitus.
 
-Jos `MAX_CONSECUTIVE_FAILURES` (oletus 6) sykliä peräkkäin epäonnistuu,
-ohjelma lopettaa ja systemd käynnistää sen uudelleen.
+## Kirjautuminen
 
-Varaus- ja aukiolotiedot päivitetään lisäksi klo 08 ja klo 20 Suomen ajassa.
+Ohjelma kirjautuu samoilla kutsuilla kuin Kirppari-Kallen kirjautumissivu ja
+valitsee kirpputorin, jos tunnukseen on liitetty useita:
+
+```ini
+KK_USERNAME=<käyttäjätunnus>
+KK_PASSWORD=<salasana>
+# Vain jos tunnuksella on useita kirpputoreja (osa nimestä riittää):
+KK_SHOP=<kirpputorin nimi>
+```
+
+Istunnon eväste tallennetaan tiedostoon `/var/lib/kirpparikalle/session.cookies`
+(oikeudet 600), joten uudelleenkäynnistys ei kirjaudu turhaan uudestaan.
+
+Kun istunto vanhenee, ohjelma kirjautuu uudelleen. Tunnuksen lukittumisen
+estämiseksi epäonnistuneen yrityksen jälkeen odotetaan
+`RELOGIN_MIN_INTERVAL_HOURS` (oletus 6) tuntia ja onnistuneenkin jälkeen
+vähintään 10 minuuttia. Sillä välin `kirpparikalle/auth` on `expired`, Home
+Assistantin ongelma-anturi on päällä ja ohjelma lopettaa virhekoodilla 2
+(systemd yrittää uudelleen 5 minuutin välein).
+
+Salasanaa ei kirjoiteta lokiin. Käytä Kirppari-Kalleen salasanaa, jota et käytä
+muualla, ja pidä `/etc/kirpparikalle.env` vain rootin luettavana (`chmod 600`).
+
+Ilman tunnuksia ohjelma voi käyttää 1.x-version `auth.json`-istuntoa (ks.
+päivitysohje), mutta istunnon vanhetessa se vain hälyttää.
 
 ## MQTT-topicit
 
 | Topic | Retain | Sisältö |
 |---|---:|---|
 | `kirpparikalle/status` | kyllä | `online` / `offline` |
-| `kirpparikalle/state` | kyllä | saldo, myyty määrä, tarkistusaika |
+| `kirpparikalle/state` | kyllä | saldo, myyty määrä, tarkistusaika, tietojen päivitysaika |
 | `kirpparikalle/update` | ei | vain oikea myyntimuutos |
 | `kirpparikalle/reservation` | kyllä | myyntijakson alku/loppu |
 | `kirpparikalle/auth` | kyllä | `ok` / `expired` |
@@ -108,9 +112,12 @@ Esimerkki `kirpparikalle/state`:
     "start": "2026-10-03",
     "end": "2026-10-10"
   },
-  "checked_at": "2026-10-03T12:01:29+03:00"
+  "checked_at": "2026-10-03T12:01:29+03:00",
+  "data_updated_at": "2026-10-03T12:01:00+03:00"
 }
 ```
+
+`data_updated_at` on Kirppari-Kallen oma "Tiedot päivitetty" -aika.
 
 Esimerkki `kirpparikalle/update`:
 
@@ -150,8 +157,8 @@ Esimerkki `kirpparikalle/reservation`:
 ```
 
 Varauspäivämäärät yhdistetään kirpputorin todellisiin aukioloaikoihin.
-`reservation` julkaistaan aina kun sen sisältö muuttuu (esim. `reservation_active`
-myyntijakson alkaessa ja päättyessä) sekä jokaisen metadatahaun yhteydessä.
+`reservation` julkaistaan aina kun sen sisältö muuttuu sekä jokaisen
+metadatahaun yhteydessä.
 
 ## Home Assistant
 
@@ -160,13 +167,24 @@ MQTT Discovery luo saman Kirppari-Kalle-laitteen alle:
 - `sensor.kirppari_kalle_saldo`
 - `sensor.kirppari_kalle_myytyja_tuotteita`
 - `sensor.kirppari_kalle_tarkistettu`
+- `sensor.kirppari_kalle_tiedot_paivitetty`
 - `sensor.kirppari_kalle_myynti_alkaa`
 - `sensor.kirppari_kalle_myynti_paattyy`
 - `event.kirppari_kalle_myyntimuutos`
 - `binary_sensor.kirppari_kalle_kirjautuminen_vanhentunut`
 
 Home Assistant voi nimetä entity-ID:t hieman eri tavalla, jos samalla nimellä on jo
-olemassa entiteettejä.
+olemassa entiteettejä. Kirjautumisanturilla ei ole availability-sidosta, joten
+sen tila näkyy myös palvelun ollessa pysähdyksissä.
+
+Esimerkit:
+
+- `home-assistant/automation.example.yaml` – ilmoitus uusista myynneistä
+  (kuuntelee suoraan `kirpparikalle/update`-topicia)
+- `home-assistant/auth_expired.example.yaml` – ilmoitus kirjautumisongelmasta
+- `home-assistant/lovelace.example.yaml` – kortti
+
+Vaihda automaatioihin oma notify-palvelu (`notify.notify`) ja tarvittaessa `target`.
 
 ## Projektin rakenne
 
@@ -176,12 +194,11 @@ kirpparikalle-mqtt/
 ├── README.md
 ├── CHANGELOG.md
 ├── requirements.txt
-├── .gitignore
 ├── kirpparikalle.env.example
 ├── systemd/
 │   └── kirpparikalle.service
 ├── tools/
-│   └── create_auth_state.py
+│   └── create_auth_state.py      (vain 1.x-istunnon luontiin, valinnainen)
 ├── home-assistant/
 │   ├── automation.example.yaml
 │   ├── auth_expired.example.yaml
@@ -192,205 +209,39 @@ kirpparikalle-mqtt/
     └── tests.yml
 ```
 
-## Versiot
-
-Versiot merkitään Git-tageilla (`v1.2.0`) ja muutokset kirjataan
-`CHANGELOG.md`:hen. Uusi julkaisu:
-
-1. päivitä `APP_VERSION` tiedostossa `kk_mqtt.py`
-2. päivitä versio README:hen ja lisää muutokset `CHANGELOG.md`:hen
-3. commitoi, tagaa ja pushaa:
-
-```bash
-git commit -am "Release 1.2.1"
-git tag -a v1.2.1 -m "v1.2.1"
-git push origin main --tags
-```
-
-Parseritestit ajetaan GitHub Actionsissa jokaisessa pushissa.
-
-## 1. Kirjautumistilan luonti Windowsissa
-
-Kirppari-Kallen pelkkä `PHPSESSID` ei osoittautunut riittäväksi. Käytössä on
-Playwrightin `storage_state`, joka säilyttää koko tarvittavan selainistunnon.
-
-Projektihakemistossa:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install playwright
-python -m playwright install chromium
-python .\tools\create_auth_state.py
-```
-
-Avautuvassa Chromiumissa:
-
-1. kirjaudu Kirppari-Kalleen
-2. valitse seurattava kirpputori
-3. avaa **Myynnin seuranta**
-4. palaa PowerShelliin ja paina Enter
-
-Tuloksena syntyy:
-
-```text
-%USERPROFILE%\kirpparikalle_state.json
-```
-
-Tiedosto vastaa käytännössä kirjautunutta istuntoa. Älä commitoi tai jaa sitä.
-
-## 2. LXC:n perusasennus
-
-Debian-LXC:
+## Asennus (Debian-LXC)
 
 ```bash
 apt update
-apt install -y python3 python3-venv python3-pip ca-certificates
-```
+apt install -y python3 python3-venv ca-certificates git
 
-Käyttäjä ja hakemistot:
-
-```bash
-useradd \
-  --system \
-  --home /opt/kirpparikalle \
-  --shell /usr/sbin/nologin \
-  kirpparikalle
-
+useradd --system --home /opt/kirpparikalle --shell /usr/sbin/nologin kirpparikalle
 mkdir -p /var/lib/kirpparikalle
-```
-
-Hae projekti GitHubista `/opt/kirpparikalle`-hakemistoon:
-
-```bash
-apt install -y git
 
 git clone https://github.com/quenthal/kirpparikalle-mqtt.git /opt/kirpparikalle
-git config --global --add safe.directory /opt/kirpparikalle
-```
+git -C /opt/kirpparikalle checkout v2.0.0
 
-Tietty versio otetaan käyttöön tagilla, esimerkiksi:
-
-```bash
-git -C /opt/kirpparikalle checkout v1.2.1
-```
-
-`venv/` ja `ms-playwright/` luodaan saman hakemiston alle, mutta `.gitignore`
-pitää ne versionhallinnan ulkopuolella.
-
-## 3. Python ja Playwright
-
-```bash
 python3 -m venv /opt/kirpparikalle/venv
+/opt/kirpparikalle/venv/bin/pip install -r /opt/kirpparikalle/requirements.txt
 
-/opt/kirpparikalle/venv/bin/pip install --upgrade pip
-
-/opt/kirpparikalle/venv/bin/pip install \
-  -r /opt/kirpparikalle/requirements.txt
-```
-
-Chromium:
-
-```bash
-export PLAYWRIGHT_BROWSERS_PATH=/opt/kirpparikalle/ms-playwright
-
-/opt/kirpparikalle/venv/bin/python \
-  -m playwright install --with-deps chromium
-```
-
-## 4. Kirjautumistila LXC:hen
-
-Windowsista:
-
-```powershell
-scp "$HOME\kirpparikalle_state.json" `
-  root@LXC_IP:/var/lib/kirpparikalle/auth.json
-```
-
-LXC:ssä:
-
-```bash
-chown kirpparikalle:kirpparikalle \
-  /var/lib/kirpparikalle/auth.json
-
-chmod 600 \
-  /var/lib/kirpparikalle/auth.json
-```
-
-## 5. MQTT-asetukset
-
-```bash
-cp \
-  /opt/kirpparikalle/kirpparikalle.env.example \
-  /etc/kirpparikalle.env
-
-nano /etc/kirpparikalle.env
-```
-
-Nykyisessä ympäristössä broker on:
-
-```ini
-MQTT_HOST=<brokerin osoite>
-MQTT_PORT=1883
-MQTT_USER=mqtt
-MQTT_PASSWORD=<oma salasana>
-```
-
-Suojaa asetukset:
-
-```bash
+cp /opt/kirpparikalle/kirpparikalle.env.example /etc/kirpparikalle.env
 chmod 600 /etc/kirpparikalle.env
-```
+nano /etc/kirpparikalle.env      # MQTT_* ja KK_*
 
-## 6. Oikeudet
+chown -R kirpparikalle:kirpparikalle /opt/kirpparikalle /var/lib/kirpparikalle
 
-```bash
-chown -R kirpparikalle:kirpparikalle \
-  /opt/kirpparikalle \
-  /var/lib/kirpparikalle
-```
-
-## 7. Systemd
-
-```bash
-cp \
-  /opt/kirpparikalle/systemd/kirpparikalle.service \
-  /etc/systemd/system/kirpparikalle.service
-
+cp /opt/kirpparikalle/systemd/kirpparikalle.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now kirpparikalle
 ```
 
-Palvelu käyttää tarkoituksella:
+Palvelu käyttää tarkoituksella `After=network.target`: testatussa Proxmox LXC:ssä
+`network-online.target` jäi odottamaan ja esti automaattikäynnistyksen.
 
-```ini
-After=network.target
-```
-
-Testatussa Proxmox LXC:ssä `network-online.target` jäi odottamaan ja esti
-automaattikäynnistyksen.
-
-## 8. Aikavyöhyke
-
-Proxmox-hostilta:
-
-```bash
-pct set <VMID> --timezone Europe/Helsinki
-```
-
-Kontissa:
-
-```bash
-timedatectl
-```
-
+Aikavyöhyke: Proxmox-hostilla `pct set <VMID> --timezone Europe/Helsinki`.
 Ohjelma käyttää lisäksi eksplisiittisesti `Europe/Helsinki`-aikavyöhykettä.
 
-## 9. Lokit
-
-```bash
-systemctl status kirpparikalle --no-pager -l
-```
+## Lokit
 
 ```bash
 journalctl -u kirpparikalle -f
@@ -400,8 +251,10 @@ Onnistuneessa käynnistyksessä:
 
 ```text
 MQTT connected
-Home Assistant MQTT Discovery julkaistu (7 entiteettiä)
+Home Assistant MQTT Discovery julkaistu (8 entiteettiä)
 Tallennettu MQTT state julkaistu uudelleen
+Kirjaudutaan Kirppari-Kalleen            (vain jos istuntoa ei ole)
+Kirjautuminen onnistui
 Metadata refreshed: Esimerkkikirppis, reservations 1. Next refresh: ...
 ```
 
@@ -409,6 +262,7 @@ Kun kirppis on auki ja varaus voimassa:
 
 ```text
 Active reservation and shop open -> reading sales
+Sales page: 1 sales tables, 3 rows, 0 rows without date
 No changes: balance 16.00 EUR, 3 sales
 ```
 
@@ -419,227 +273,65 @@ CHANGE: 16.00 -> 24.00 EUR, new 1, removed 0
 NEW SALE: 03.10.2026 | Esimerkkituote | 8.00 EUR
 ```
 
-## 10. MQTT:n tarkistus
+MQTT:n tarkistus: `mosquitto_sub -h <MQTT_HOST> -u <käyttäjä> -P '<salasana>' -t 'kirpparikalle/#' -v`
+(Discovery: `-t 'homeassistant/#'`).
 
-```bash
-apt install -y mosquitto-clients
-```
+## Tilatiedostot
 
-```bash
-mosquitto_sub \
-  -h <MQTT_HOST> \
-  -p 1883 \
-  -u mqtt \
-  -P '<salasana>' \
-  -t 'kirpparikalle/#' \
-  -v
-```
+`/var/lib/kirpparikalle/`:
 
-Discovery:
+- `monitor_state.json` – edellinen myyntiluku; restart ei ilmoita jo havaittuja
+  myyntejä uutena. Uuden varauksen ensimmäinen luku otetaan lähtötilaksi.
+- `session.cookies` – Kirppari-Kallen istunto (salaisuus, 600)
+- `last_login_attempt.json` – edellisen kirjautumisyrityksen aika ja tulos
 
-```bash
-mosquitto_sub \
-  -h <MQTT_HOST> \
-  -p 1883 \
-  -u mqtt \
-  -P '<salasana>' \
-  -t 'homeassistant/#' \
-  -v
-```
-
-## 11. Home Assistant -ilmoitus
-
-Valmis nykyisen projektin automaatio:
-
-```text
-home-assistant/automation.example.yaml
-```
-
-Se käyttää:
-
-```text
-notify.notify
-```
-
-Vaihda tilalle oma notify-palvelu ja tarvittaessa `target`.
-
-Automaatio kuuntelee suoraan:
-
-```text
-kirpparikalle/update
-```
-
-Sensorien entity-ID:t eivät siis vaikuta ilmoituksen toimintaan.
-
-Kirjautumisen vanhenemisesta ilmoittaa vastaavasti:
-
-```text
-home-assistant/auth_expired.example.yaml
-```
-
-## 12. Lovelace
-
-Esimerkki:
-
-```text
-home-assistant/lovelace.example.yaml
-```
-
-Kortissa näkyvät:
-
-- saldo
-- myytyjen tuotteiden määrä
-- myynti alkaa
-- myynti päättyy
-- viimeinen tarkistus
-
-## 13. Tilatiedosto
-
-```text
-/var/lib/kirpparikalle/monitor_state.json
-```
-
-Sen avulla restart ei ilmoita jo havaittuja myyntejä uutena.
-
-Kun uusi varaus alkaa, sen ensimmäinen onnistunut myyntiluku otetaan lähtötilaksi.
-
-## 14. Metadata
-
-Varaus- ja aukiolotiedot haetaan:
-
-- palvelun käynnistyessä
-- noin klo 08
-- noin klo 20
-
-Pääsilmukka herää 5 minuutin välein, joten kellonaikapäivitys voi käytännössä
-tapahtua muutaman minuutin tavoiteajan jälkeen.
-
-## 15. Kirjautumisen vanheneminen
-
-Jos Kirppari-Kalle palauttaa kirjautumissivun, ohjelma julkaisee
-`kirpparikalle/auth` = `expired` ja lopettaa ajon virhekoodilla. Home Assistantissa
-anturi `binary_sensor.kirppari_kalle_kirjautuminen_vanhentunut` menee tilaan
-*ongelma*; sen varaan voi tehdä ilmoitusautomaation. Anturilla ei ole
-availability-sidosta, joten tila näkyy myös palvelun ollessa pysähdyksissä.
-Systemd yrittää käynnistää sen uudelleen viiden minuutin kuluttua.
-
-Jos istunto on oikeasti vanhentunut:
-
-1. luo uusi `kirpparikalle_state.json`
-2. kopioi se `/var/lib/kirpparikalle/auth.json`
-3. korjaa oikeudet
-4. restarttaa palvelu
-
-```bash
-systemctl restart kirpparikalle
-```
-
-## 16. Testit
-
-```bash
-cd /opt/kirpparikalle
-
-./venv/bin/python \
-  -m unittest discover \
-  -s tests \
-  -v
-```
-
-Testit käyttävät paikallisia esimerkkitekstejä eivätkä ota verkkoyhteyttä
-Kirppari-Kalleen.
-
-## 17. Tietoturva
-
-Älä commitoi:
-
-- `auth.json`
-- `kirpparikalle_state.json`
-- `monitor_state.json`
-- oikeaa MQTT-salasanaa
-
-`.gitignore` sisältää näille tavallisimmat suojaukset.
-
-## Päivitys nykyiseen LXC-asennukseen
-
-Seuraavat tiedostot ovat Git-hakemiston ulkopuolella, joten päivitys ei koske
-niihin. **Älä poista tai luo niitä uudelleen**:
-
-```text
-/var/lib/kirpparikalle/auth.json
-/var/lib/kirpparikalle/monitor_state.json
-/etc/kirpparikalle.env
-```
-
-### A. Ensimmäinen siirtyminen Gitiin
-
-Jos `/opt/kirpparikalle` on aiemmin kopioitu käsin (ei Git-hakemisto), muutetaan
-se Git-hakemistoksi paikallaan. Olemassa olevat `venv/` ja `ms-playwright/`
-säilyvät, ja projektin tiedostot korvautuvat GitHubin versioilla:
-
-```bash
-apt install -y git
-systemctl stop kirpparikalle
-
-cd /opt/kirpparikalle
-git config --global --add safe.directory /opt/kirpparikalle
-git init
-git remote add origin https://github.com/quenthal/kirpparikalle-mqtt.git
-git fetch origin
-git checkout -f -B main origin/main
-```
-
-Jatka kohdasta **C**.
-
-### B. Myöhemmät päivitykset
+## Päivitys
 
 ```bash
 systemctl stop kirpparikalle
-
-git -C /opt/kirpparikalle pull --ff-only
-```
-
-Tai tietty versio:
-
-```bash
 git -C /opt/kirpparikalle fetch --tags
-git -C /opt/kirpparikalle checkout v1.2.1
-```
-
-### C. Riippuvuudet, oikeudet ja systemd
-
-Päivitä riippuvuudet:
-
-```bash
-/opt/kirpparikalle/venv/bin/pip install \
-  -r /opt/kirpparikalle/requirements.txt
-```
-
-Jos Playwrightin versio nousi, päivitä myös Chromium:
-
-```bash
-PLAYWRIGHT_BROWSERS_PATH=/opt/kirpparikalle/ms-playwright \
-  /opt/kirpparikalle/venv/bin/python -m playwright install chromium
-```
-
-Korjaa oikeudet:
-
-```bash
+git -C /opt/kirpparikalle checkout v2.0.0
+/opt/kirpparikalle/venv/bin/pip install -r /opt/kirpparikalle/requirements.txt
 chown -R kirpparikalle:kirpparikalle /opt/kirpparikalle
-```
-
-Päivitä systemd-yksikkö:
-
-```bash
-cp \
-  /opt/kirpparikalle/systemd/kirpparikalle.service \
-  /etc/systemd/system/kirpparikalle.service
-
+cp /opt/kirpparikalle/systemd/kirpparikalle.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl start kirpparikalle
 ```
 
-Tarkista:
+`/etc/kirpparikalle.env` ja `/var/lib/kirpparikalle/` ovat Git-hakemiston
+ulkopuolella, eikä päivitys koske niihin.
+
+### 1.x → 2.0
+
+1. Lisää `/etc/kirpparikalle.env`:iin `KK_USERNAME`, `KK_PASSWORD` ja tarvittaessa
+   `KK_SHOP`.
+2. Päivitä kuten yllä. Ensimmäinen käynnistys kirjautuu tunnuksilla ja luo
+   `session.cookies`-tiedoston. (Ilman tunnuksia 1.x:n `auth.json`-istunto otetaan
+   käyttöön sellaisenaan.)
+3. Playwright ja Chromium (`ms-playwright/`) jäävät levylle, joten paluu 1.x:ään
+   onnistuu. Kun 2.0 on todettu toimivaksi, ne voi poistaa:
+   `rm -rf /opt/kirpparikalle/ms-playwright` ja
+   `/opt/kirpparikalle/venv/bin/pip uninstall -y playwright`.
+
+`SALES_SETTLE_MS` ei ole enää käytössä.
+
+## Testit
 
 ```bash
-journalctl -u kirpparikalle -f
+/opt/kirpparikalle/venv/bin/python -m unittest discover -s tests -v
 ```
+
+Testit käyttävät paikallisia esimerkkisivuja eivätkä ota verkkoyhteyttä
+Kirppari-Kalleen. GitHub Actions ajaa ne jokaisessa pushissa.
+
+## Versiot
+
+Versiot merkitään Git-tageilla (`v2.0.0`) ja muutokset kirjataan `CHANGELOG.md`:hen:
+päivitä `APP_VERSION` (`kk_mqtt.py`), README ja CHANGELOG, commitoi ja tagaa.
+
+## Tietoturva
+
+Älä commitoi tai jaa: `/etc/kirpparikalle.env` (MQTT-salasana, Kirppari-Kallen
+tunnukset), `session.cookies`, `auth.json`, `kirpparikalle_state.json`,
+`monitor_state.json` (sisältää myyntitiedot). `.gitignore` sisältää näille
+tavallisimmat suojaukset.
