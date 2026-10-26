@@ -9,7 +9,6 @@ Group=kirpparikalle
 WorkingDirectory=/opt/kirpparikalle
 
 EnvironmentFile=/etc/kirpparikalle.env
-Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/kirpparikalle/ms-playwright
 
 ExecStart=/opt/kirpparikalle/venv/bin/python /opt/kirpparikalle/kk_mqtt.py
 

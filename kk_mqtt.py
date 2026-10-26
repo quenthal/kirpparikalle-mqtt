@@ -2,21 +2,23 @@
 """
 Kirppari-Kalle -> MQTT -> Home Assistant monitor.
 
-Version 1.2.2
+Version 2.0.0
 
-- Reuses a Playwright storage_state file for authentication.
+- Plain HTTP (standard library), no browser. Logs in with KK_USERNAME /
+  KK_PASSWORD and keeps the session cookie in a file.
 - Reads reservations and opening hours at startup and around 08:00 / 20:00.
 - Reads sales every 5 minutes only while a reservation is active and the shop is open,
   plus one final read after closing time.
 - Keeps the session alive with a light page load (default every 60 minutes).
-- Optionally logs in again automatically when the session has expired.
-- Waits 5 seconds for the animated balance to settle.
+- Logs in again automatically when the session has expired.
+- Reads the exact balance from the page's hidden field (no animation wait).
 - Publishes retained current state and non-retained change events to MQTT.
 - Publishes Home Assistant MQTT Discovery entities.
 """
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import logging
 import os
@@ -24,15 +26,17 @@ import re
 import signal
 import sys
 import threading
+import urllib.parse
+import urllib.request
 from datetime import date, datetime, time as dt_time, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import paho.mqtt.client as mqtt
-from playwright.sync_api import Page, sync_playwright
 
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "2.0.0"
 TZ = ZoneInfo("Europe/Helsinki")
 
 DATA_DIR = Path(os.getenv("KK_DATA_DIR", "/var/lib/kirpparikalle"))
@@ -42,33 +46,29 @@ AUTH_STATE_FILE = Path(
 MONITOR_STATE_FILE = Path(
     os.getenv("KK_MONITOR_STATE_FILE", str(DATA_DIR / "monitor_state.json"))
 )
-RELOGIN_STATE_FILE = DATA_DIR / "last_login_attempt"
+SESSION_FILE = Path(
+    os.getenv("KK_SESSION_FILE", str(DATA_DIR / "session.cookies"))
+)
+RELOGIN_STATE_FILE = DATA_DIR / "last_login_attempt.json"
 
-RESERVATIONS_URL = (
-    "https://www.kirpparikalle.net/sovellus/index.php?page=myreservations"
-)
-COMPANY_URL = (
-    "https://www.kirpparikalle.net/sovellus/index.php?page=companydetails"
-)
-SALES_URL = (
-    "https://www.kirpparikalle.net/sovellus/index.php?page=mysales"
-)
-LOGIN_URL = (
-    "https://www.kirpparikalle.net/sovellus/guest.php?page=login"
-)
+BASE_URL = "https://www.kirpparikalle.net/sovellus/"
+USER_AGENT = "Mozilla/5.0 (compatible; kirpparikalle-mqtt)"
+HTTP_TIMEOUT = 30
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))
-SALES_SETTLE_MS = int(os.getenv("SALES_SETTLE_MS", "5000"))
 FINAL_READ_DELAY_MINUTES = int(os.getenv("FINAL_READ_DELAY_MINUTES", "10"))
 MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "6"))
 KEEPALIVE_MINUTES = int(os.getenv("KEEPALIVE_MINUTES", "60"))
 
-# Automatic re-login (optional). Without credentials an expired session
-# only raises the auth problem sensor, as before.
+# Kirppari-Kalle credentials. Without them only an imported auth.json
+# session is used, and its expiry just raises the auth problem sensor.
 KK_USERNAME = os.getenv("KK_USERNAME", "")
 KK_PASSWORD = os.getenv("KK_PASSWORD", "")
 KK_SHOP = os.getenv("KK_SHOP", "")
+# Wait this long after a FAILED login before trying again (account lockout).
 RELOGIN_MIN_INTERVAL_HOURS = float(os.getenv("RELOGIN_MIN_INTERVAL_HOURS", "6"))
+# Minimum gap between logins even after a successful one.
+RELOGIN_MIN_GAP = timedelta(minutes=10)
 
 MQTT_HOST = os.getenv("MQTT_HOST", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -320,13 +320,22 @@ def keepalive_due(last_activity: datetime | None, now: datetime) -> bool:
     return now - last_activity >= timedelta(minutes=KEEPALIVE_MINUTES)
 
 
-def relogin_allowed(last_attempt: datetime | None, now: datetime) -> bool:
-    """Credentials are set and the previous attempt is old enough."""
+def relogin_allowed(last_attempt: dict | None, now: datetime) -> bool:
+    """
+    Credentials are set and the previous attempt is old enough:
+    RELOGIN_MIN_INTERVAL_HOURS after a failure, RELOGIN_MIN_GAP after success.
+    """
     if not (KK_USERNAME and KK_PASSWORD):
         return False
-    if last_attempt is None:
+    if not last_attempt:
         return True
-    return now - last_attempt >= timedelta(hours=RELOGIN_MIN_INTERVAL_HOURS)
+    try:
+        at = datetime.fromisoformat(last_attempt["at"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    if last_attempt.get("ok"):
+        return now - at >= RELOGIN_MIN_GAP
+    return now - at >= timedelta(hours=RELOGIN_MIN_INTERVAL_HOURS)
 
 
 def choose_shop_option(names: list[str], wanted: str) -> int:
@@ -348,18 +357,18 @@ def choose_shop_option(names: list[str], wanted: str) -> int:
     )
 
 
-def load_last_login_attempt() -> datetime | None:
+def load_last_login_attempt() -> dict | None:
     try:
-        return datetime.fromisoformat(
-            RELOGIN_STATE_FILE.read_text(encoding="utf-8").strip()
-        )
+        return json.loads(RELOGIN_STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
 
-def save_last_login_attempt(when: datetime) -> None:
+def save_last_login_attempt(when: datetime, ok: bool) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    RELOGIN_STATE_FILE.write_text(when.isoformat(), encoding="utf-8")
+    RELOGIN_STATE_FILE.write_text(
+        json.dumps({"at": when.isoformat(), "ok": ok}), encoding="utf-8"
+    )
 
 
 def next_metadata_refresh(now: datetime) -> datetime:
@@ -382,11 +391,86 @@ def next_metadata_refresh(now: datetime) -> datetime:
     )
 
 
-def page_is_login(page: Page, text: str) -> bool:
+class PageDoc(HTMLParser):
+    """
+    Minimal HTML reader: inner_text-like text (scripts/styles skipped,
+    block elements on their own lines), tables as rows of cell texts,
+    <input> values by id and <h1> texts.
+    """
+
+    BLOCK = {
+        "tr", "div", "p", "br", "li", "table", "section",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+    }
+
+    def __init__(self, html: str):
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip = 0
+        self._cell: list[str] | None = None
+        self._row: list[str] | None = None
+        self._h1: list[str] | None = None
+        self.tables: list[list[list[str]]] = []
+        self.inputs: dict[str, str] = {}
+        self.h1: list[str] = []
+        self.feed(html)
+        self.close()
+        self.text = "".join(self._parts)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+            return
+        if tag == "input":
+            a = dict(attrs)
+            if a.get("id"):
+                self.inputs[a["id"]] = a.get("value") or ""
+        if tag == "table":
+            self.tables.append([])
+        elif tag == "tr":
+            self._row = []
+        elif tag in ("td", "th"):
+            self._cell = []
+            self._parts.append("\t")
+        if tag == "h1":
+            self._h1 = []
+        if tag in self.BLOCK:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+            return
+        if tag in ("td", "th") and self._cell is not None:
+            if self._row is not None:
+                self._row.append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if self.tables:
+                self.tables[-1].append(self._row)
+            self._row = None
+        if tag == "h1" and self._h1 is not None:
+            self.h1.append(" ".join("".join(self._h1).split()))
+            self._h1 = None
+        if tag in self.BLOCK:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        self._parts.append(data)
+        if self._cell is not None:
+            self._cell.append(data)
+        if self._h1 is not None:
+            self._h1.append(data)
+
+
+def is_login_page(final_url: str, text: str) -> bool:
     lower = text.lower()
 
     return (
-        "page=login" in page.url.lower()
+        "guest.php" in final_url
+        or "page=login" in final_url.lower()
         or (
             "kirjaudu sisään" in lower
             and "kirjaudu ulos" not in lower
@@ -394,117 +478,222 @@ def page_is_login(page: Page, text: str) -> bool:
     )
 
 
-def get_page_text(page: Page, url: str) -> str:
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    text = page.locator("body").inner_text()
+class KirppariKalleClient:
+    """Kirppari-Kalle web UI over plain HTTP with a persistent cookie jar."""
 
-    if page_is_login(page, text):
-        raise AuthExpired(
-            "Kirppari-Kalle-kirjautuminen on vanhentunut. "
-            "Luo uusi auth.json."
+    def __init__(self, cookie_file: Path, opener=None):
+        self.cookie_file = cookie_file
+        self.jar = http.cookiejar.MozillaCookieJar(str(cookie_file))
+        if cookie_file.exists():
+            try:
+                self.jar.load(ignore_discard=True, ignore_expires=True)
+            except (OSError, http.cookiejar.LoadError):
+                logging.warning("Istuntotiedoston luku epäonnistui; aloitetaan tyhjästä")
+        self.opener = opener or urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar)
         )
+        self.opener.addheaders = [("User-Agent", USER_AGENT)]
 
-    return text
+    def has_session(self) -> bool:
+        return any(c.name == "PHPSESSID" for c in self.jar)
 
+    def get(self, path: str, params: dict | None = None) -> tuple[str, str]:
+        url = BASE_URL + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        with self.opener.open(url, timeout=HTTP_TIMEOUT) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.geturl(), resp.read().decode(charset, "replace")
 
-def login(page: Page) -> None:
-    """
-    Log in with KK_USERNAME / KK_PASSWORD like a user would, choosing the
-    shop when the account has several. Never logs the credentials.
-    """
-    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
-    page.fill("#username", KK_USERNAME)
-    page.fill("#password", KK_PASSWORD)
-    page.click('input[type="submit"][value="Kirjaudu"]')
+    def page(self, name: str) -> PageDoc:
+        final_url, body = self.get("index.php", {"page": name})
+        doc = PageDoc(body)
+        if is_login_page(final_url, doc.text):
+            raise AuthExpired("Kirppari-Kalle-kirjautuminen on vanhentunut.")
+        return doc
 
-    chosen = False
-    for _ in range(60):
-        page.wait_for_timeout(500)
-
-        if "guest.php" not in page.url:
-            break
-
+    def _rpc(self, params: dict) -> dict:
+        _, body = self.get("rpc.php", {"request": "json_login", "lang": "fi", **params})
         try:
-            options = page.locator(".login_company_option")
-            count = options.count()
-        except Exception:
-            # The page is navigating.
-            continue
+            return json.loads(body)
+        except ValueError:
+            raise LoginFailed("rpc.php ei palauttanut JSONia") from None
 
-        if count and not chosen:
-            names = [options.nth(i).inner_text().strip() for i in range(count)]
-            options.nth(choose_shop_option(names, KK_SHOP)).click()
-            chosen = True
-    else:
-        raise LoginFailed(
-            "Kirjautuminen ei edennyt 30 sekunnissa "
-            "(väärä tunnus/salasana tai sivu muuttunut)"
+    def login(self, username: str, password: str, shop: str = "") -> None:
+        """
+        The same calls the login page makes: username_login, then
+        choose_company when the account has several shops.
+        Never logs the credentials (they travel in the query string).
+        """
+        try:
+            self.jar.clear()
+            self.get("guest.php", {"page": "login"})
+            data = self._rpc({
+                "method": "username_login",
+                "company_id": 1,
+                "username": username,
+                "password": password,
+            })
+        except LoginFailed:
+            raise
+        except Exception as exc:
+            raise LoginFailed(f"kirjautumispyyntö epäonnistui ({type(exc).__name__})") from None
+
+        if data.get("status") != "success":
+            raise LoginFailed(f"kirjautuminen hylättiin ({data.get('object') or 'tuntematon'})")
+
+        if str(data.get("redirect")).lower() != "true":
+            companies = data.get("companies") or {}
+            items = list(companies.values()) if isinstance(companies, dict) else list(companies)
+            if not items:
+                raise LoginFailed("tunnukseen ei ole liitetty kirpputoreja")
+            names = [str(item.get("name", "")) for item in items]
+            chosen = items[choose_shop_option(names, shop)]
+            try:
+                data = self._rpc({"method": "choose_company", "company_id": chosen["company_id"]})
+            except LoginFailed:
+                raise
+            except Exception as exc:
+                raise LoginFailed(f"kirpputorin valinta epäonnistui ({type(exc).__name__})") from None
+            if data.get("status") != "success":
+                raise LoginFailed("kirpputorin valinta hylättiin")
+
+        # Verify with a real page; raises AuthExpired if still logged out.
+        self.page("myreservations")
+        self.save()
+
+    def save(self) -> None:
+        self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
+        self.jar.save(ignore_discard=True, ignore_expires=True)
+        os.chmod(self.cookie_file, 0o600)
+
+    def import_storage_state(self, path: Path) -> int:
+        """Take the cookies of a Playwright storage_state file (auth.json)."""
+        data = json.loads(path.read_text(encoding="utf-8"))
+        count = 0
+        for c in data.get("cookies", []):
+            expires = c.get("expires", -1)
+            domain = c.get("domain", "")
+            self.jar.set_cookie(http.cookiejar.Cookie(
+                0, c["name"], c["value"], None, False,
+                domain, True, domain.startswith("."),
+                c.get("path", "/"), True, bool(c.get("secure")),
+                None if expires is None or expires < 0 else int(expires),
+                expires is None or expires < 0,
+                None, None, {"HttpOnly": None} if c.get("httpOnly") else {},
+            ))
+            count += 1
+        return count
+
+
+def parse_balance(doc: PageDoc) -> float:
+    """
+    The page animates the visible balance with JavaScript; the exact value
+    is in a hidden field. Falls back to the visible "Saldo 12,34 €" text.
+    """
+    value = doc.inputs.get("client_balance_float", "").strip()
+
+    if not value:
+        match = re.search(
+            r"Saldo\s+([0-9\s]+(?:[,.][0-9]{1,2})?)\s*€",
+            doc.text,
+            re.IGNORECASE,
         )
+        if not match:
+            raise RuntimeError("Saldoa ei löytynyt mysales-sivulta.")
+        value = match.group(1)
 
-    # Verify with a real page; raises AuthExpired if still logged out.
-    get_page_text(page, RESERVATIONS_URL)
+    return round(
+        float(value.replace("\xa0", "").replace(" ", "").replace(",", ".")),
+        2,
+    )
 
 
-def parse_balance(text: str) -> float:
+def parse_data_updated(text: str) -> datetime | None:
+    """ "Tiedot päivitetty: 26.10.2026 11:40" on the sales page."""
     match = re.search(
-        r"Saldo\s+([0-9\s]+(?:[,.][0-9]{1,2})?)\s*€",
+        r"Tiedot p(?:ä|&auml;)ivitetty:\s*(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})",
         text,
-        re.IGNORECASE,
     )
-
     if not match:
-        raise RuntimeError("Saldoa ei löytynyt mysales-sivulta.")
-
-    value = (
-        match.group(1)
-        .replace("\xa0", "")
-        .replace(" ", "")
-        .replace(",", ".")
-    )
-
-    return round(float(value), 2)
+        return None
+    return datetime.strptime(
+        f"{match.group(1)} {match.group(2)}", "%d.%m.%Y %H:%M"
+    ).replace(tzinfo=TZ)
 
 
-def parse_sales(text: str) -> list[dict]:
+PRICE_RE = re.compile(r"(\d+(?:[\s\xa0]\d{3})*[,.]\d{2})\s*€")
+SALE_DATE_RE = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
+
+
+def parse_sales(
+    tables: list[list[list[str]]],
+    stats: dict | None = None,
+) -> list[dict]:
+    """
+    Sold items from the sales tables: a header row (Nro, Nimi, Hinta, ...),
+    date rows with a single cell and item rows. Columns are found by header
+    name, so hidden extra columns (Määrä, ALV, ...) do not matter.
+    Keys stay compatible with the 1.x text parser (date|number|name|price).
+    """
     sales: list[dict] = []
-    current_date: str | None = None
-    in_table = False
+    seen: set[str] = set()
+    stats = stats if stats is not None else {}
+    stats.update(tables=0, rows=0, undated=0)
 
-    for raw_line in text.splitlines():
-        line = " ".join(raw_line.split())
+    for table in tables:
+        cols: dict[str, int] | None = None
+        current_date: str | None = None
 
-        if (
-            line.lower().startswith("nro")
-            and "nimi" in line.lower()
-            and "hinta" in line.lower()
-        ):
-            in_table = True
-            continue
+        for row in table:
+            lower = [cell.lower() for cell in row]
 
-        if not in_table:
-            continue
+            if "nro" in lower and "nimi" in lower and "hinta" in lower:
+                cols = {name: lower.index(name) for name in ("nro", "nimi", "hinta")}
+                stats["tables"] += 1
+                continue
 
-        if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", line):
-            current_date = line
-            continue
+            if cols is None:
+                continue
 
-        match = re.match(
-            r"^(\d+)\s+(.+?)\s+(\d+[,.]\d{2})\s*€$",
-            line,
-        )
+            cells = [cell for cell in row if cell]
+            if len(cells) == 1:
+                date_match = SALE_DATE_RE.match(cells[0])
+                if date_match:
+                    current_date = date_match.group(1)
+                continue
 
-        if match and current_date:
-            sales.append(
-                {
-                    "date": current_date,
-                    "number": int(match.group(1)),
-                    "name": match.group(2).strip(),
-                    "price": round(
-                        float(match.group(3).replace(",", ".")),
-                        2,
+            if len(row) <= max(cols.values()):
+                continue
+
+            number = row[cols["nro"]]
+            price = PRICE_RE.search(row[cols["hinta"]])
+            if not number.isdigit() or not price:
+                continue
+
+            if not current_date:
+                stats["undated"] += 1
+                continue
+
+            sale = {
+                "date": current_date,
+                "number": int(number),
+                "name": row[cols["nimi"]].strip(),
+                "price": round(
+                    float(
+                        price.group(1)
+                        .replace("\xa0", "")
+                        .replace(" ", "")
+                        .replace(",", ".")
                     ),
-                }
-            )
+                    2,
+                ),
+            }
+            key = sale_key(sale)
+            if key not in seen:
+                seen.add(key)
+                sales.append(sale)
+                stats["rows"] += 1
 
     return sales
 
@@ -533,6 +722,7 @@ def save_monitor_state(
     balance: float,
     sales: list[dict],
     checked_at: datetime,
+    data_updated: datetime | None = None,
 ) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -545,6 +735,7 @@ def save_monitor_state(
         "balance": balance,
         "sales": sales,
         "checked_at": checked_at.isoformat(),
+        "data_updated_at": data_updated.isoformat() if data_updated else None,
     }
 
     temp_file = MONITOR_STATE_FILE.with_suffix(".tmp")
@@ -651,6 +842,15 @@ def publish_home_assistant_discovery(client: mqtt.Client) -> None:
             "device_class": "timestamp",
             "entity_category": "diagnostic",
         },
+        f"{HA_DISCOVERY_PREFIX}/sensor/{HA_DEVICE_ID}/data_updated_at/config": {
+            **common,
+            "name": "Tiedot päivitetty",
+            "unique_id": "kirpparikalle_data_updated_at",
+            "state_topic": MQTT_STATE_TOPIC,
+            "value_template": "{{ value_json.data_updated_at | default(none) }}",
+            "device_class": "timestamp",
+            "entity_category": "diagnostic",
+        },
         f"{HA_DISCOVERY_PREFIX}/sensor/{HA_DEVICE_ID}/reservation_start/config": {
             **common,
             "name": "Myynti alkaa",
@@ -706,6 +906,7 @@ def build_state_payload(
     balance: float,
     sales: list[dict],
     checked_at: datetime,
+    data_updated: datetime | None = None,
 ) -> dict:
     return {
         "shop": shop,
@@ -716,6 +917,7 @@ def build_state_payload(
             "end": reservation[1].isoformat(),
         },
         "checked_at": checked_at.isoformat(),
+        "data_updated_at": data_updated.isoformat() if data_updated else None,
     }
 
 
@@ -739,6 +941,7 @@ def republish_saved_state(client: mqtt.Client) -> None:
             "end": reservation.get("end"),
         },
         "checked_at": previous.get("checked_at"),
+        "data_updated_at": previous.get("data_updated_at"),
     }
 
     mqtt_publish_json(
@@ -867,19 +1070,14 @@ def make_mqtt_client() -> mqtt.Client:
 
 
 def refresh_metadata(
-    page: Page,
+    client: KirppariKalleClient,
 ) -> tuple[
     str,
     list[tuple[date, date]],
     dict[int, tuple[dt_time, dt_time] | None],
 ]:
-    reservation_text = get_page_text(
-        page,
-        RESERVATIONS_URL,
-    )
-
     reservations = parse_reservations(
-        reservation_text
+        client.page("myreservations").text
     )
 
     if not reservations:
@@ -887,14 +1085,8 @@ def refresh_metadata(
             "Varauksia ei löytynyt myreservations-sivulta"
         )
 
-    company_text = get_page_text(
-        page,
-        COMPANY_URL,
-    )
-
-    opening_hours = parse_opening_hours(
-        company_text
-    )
+    company = client.page("companydetails")
+    opening_hours = parse_opening_hours(company.text)
 
     if not any(opening_hours.values()):
         logging.warning(
@@ -902,38 +1094,38 @@ def refresh_metadata(
             "myyntejä ei lueta"
         )
 
-    shop = "Kirppari-Kalle"
-
-    headings = page.locator("h1")
-
-    if headings.count() > 0:
-        candidate = headings.first.inner_text().strip()
-
-        if candidate:
-            shop = candidate
+    shop = next((h for h in company.h1 if h), "Kirppari-Kalle")
 
     return shop, reservations, opening_hours
 
 
-def read_sales(page: Page) -> tuple[float, list[dict]]:
-    page.goto(
-        SALES_URL,
-        wait_until="domcontentloaded",
-        timeout=30000,
+def read_sales(
+    client: KirppariKalleClient,
+) -> tuple[float, list[dict], datetime | None]:
+    doc = client.page("mysales")
+    balance = parse_balance(doc)
+    stats: dict = {}
+    sales = parse_sales(doc.tables, stats)
+
+    logging.info(
+        "Sales page: %d sales tables, %d rows, %d rows without date",
+        stats["tables"],
+        stats["rows"],
+        stats["undated"],
     )
 
-    # Kirppari-Kalle animates the balance after page load.
-    page.wait_for_timeout(SALES_SETTLE_MS)
-
-    text = page.locator("body").inner_text()
-
-    if page_is_login(page, text):
-        raise AuthExpired(
-            "Kirppari-Kalle-kirjautuminen on vanhentunut. "
-            "Luo uusi auth.json."
+    # The balance is the total of sold items before payouts.
+    total = round(sum(sale["price"] for sale in sales), 2)
+    if sales and abs(total - balance) > 0.005:
+        logging.warning(
+            "Myytyjen tuotteiden summa %.2f EUR ei vastaa saldoa %.2f EUR "
+            "(%d riviä) – tarkista myyntitaulun luku",
+            total,
+            balance,
+            len(sales),
         )
 
-    return parse_balance(text), parse_sales(text)
+    return balance, sales, parse_data_updated(doc.text)
 
 
 def process_sales_change(
@@ -943,6 +1135,7 @@ def process_sales_change(
     balance: float,
     sales: list[dict],
     checked_at: datetime,
+    data_updated: datetime | None = None,
 ) -> None:
     previous = load_monitor_state()
 
@@ -952,6 +1145,7 @@ def process_sales_change(
         balance,
         sales,
         checked_at,
+        data_updated,
     )
 
     baseline_changed = (
@@ -975,6 +1169,7 @@ def process_sales_change(
             balance,
             sales,
             checked_at,
+            data_updated,
         )
 
         logging.info(
@@ -1065,6 +1260,7 @@ def process_sales_change(
         balance,
         sales,
         checked_at,
+        data_updated,
     )
 
     logging.info(
@@ -1082,6 +1278,37 @@ def process_sales_change(
             sale["name"],
             sale["price"],
         )
+
+
+def attempt_login(client: KirppariKalleClient) -> bool:
+    """Log in if credentials are set and the attempt pacing allows it."""
+    attempt_at = datetime.now(TZ)
+
+    if not relogin_allowed(load_last_login_attempt(), attempt_at):
+        if KK_USERNAME and KK_PASSWORD:
+            logging.info(
+                "Edellinen kirjautumisyritys liian äskettäin "
+                "(epäonnistuneen jälkeen odotetaan %s h); ei yritetä nyt",
+                f"{RELOGIN_MIN_INTERVAL_HOURS:g}",
+            )
+        return False
+
+    logging.info("Kirjaudutaan Kirppari-Kalleen")
+    save_last_login_attempt(attempt_at, ok=False)
+
+    try:
+        client.login(KK_USERNAME, KK_PASSWORD, KK_SHOP)
+    except (LoginFailed, AuthExpired) as exc:
+        logging.error("Kirjautuminen epäonnistui: %s", exc)
+        return False
+    except Exception as exc:
+        # Not logged in full: request URLs carry credentials.
+        logging.error("Kirjautuminen epäonnistui: %s", type(exc).__name__)
+        return False
+
+    save_last_login_attempt(attempt_at, ok=True)
+    logging.info("Kirjautuminen onnistui")
+    return True
 
 
 def main() -> int:
@@ -1105,10 +1332,13 @@ def main() -> int:
 
         return 1
 
-    if not AUTH_STATE_FILE.exists() and not (KK_USERNAME and KK_PASSWORD):
+    if (
+        not (KK_USERNAME and KK_PASSWORD)
+        and not SESSION_FILE.exists()
+        and not AUTH_STATE_FILE.exists()
+    ):
         logging.error(
-            "Kirjautumistiedostoa ei löydy: %s (eikä KK_USERNAME/KK_PASSWORD)",
-            AUTH_STATE_FILE,
+            "KK_USERNAME/KK_PASSWORD puuttuvat eikä tallennettua istuntoa ole"
         )
 
         return 1
@@ -1126,238 +1356,199 @@ def main() -> int:
             mqtt_client
         )
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-            )
+        client = KirppariKalleClient(SESSION_FILE)
 
-            context = browser.new_context(
-                storage_state=(
-                    str(AUTH_STATE_FILE) if AUTH_STATE_FILE.exists() else None
-                ),
-                timezone_id="Europe/Helsinki",
-            )
+        if not client.has_session():
+            if KK_USERNAME and KK_PASSWORD:
+                logging.info("Ei tallennettua istuntoa")
+                if not attempt_login(client):
+                    publish_auth_state(mqtt_client, "expired")
+                    return 2
+            elif AUTH_STATE_FILE.exists():
+                # 1.x without credentials: reuse the browser session.
+                count = client.import_storage_state(AUTH_STATE_FILE)
+                client.save()
+                logging.info("auth.json tuotu istuntotiedostoon (%d evästettä)", count)
 
-            page = context.new_page()
+        shop: str | None = None
+        reservations: list[
+            tuple[date, date]
+        ] = []
 
-            shop: str | None = None
-            reservations: list[
-                tuple[date, date]
-            ] = []
+        opening_hours: dict[
+            int,
+            tuple[dt_time, dt_time] | None,
+        ] = {}
 
-            opening_hours: dict[
-                int,
-                tuple[dt_time, dt_time] | None,
-            ] = {}
+        next_meta_refresh: datetime | None = None
+        reservation_payload: dict | None = None
+        auth_state: str | None = None
+        final_read_done_for: date | None = None
+        last_activity: datetime | None = None
+        consecutive_failures = 0
 
-            next_meta_refresh: datetime | None = None
-            reservation_payload: dict | None = None
-            auth_state: str | None = None
-            final_read_done_for: date | None = None
-            last_activity: datetime | None = None
-            consecutive_failures = 0
+        while not STOP_EVENT.is_set():
+            try:
+                now = datetime.now(TZ)
 
-            while not STOP_EVENT.is_set():
-                try:
-                    now = datetime.now(TZ)
-
-                    if (
-                        shop is None
-                        or next_meta_refresh is None
-                        or now >= next_meta_refresh
-                    ):
-                        (
-                            shop,
-                            reservations,
-                            opening_hours,
-                        ) = refresh_metadata(page)
-
-                        context.storage_state(
-                            path=str(AUTH_STATE_FILE)
-                        )
-
-                        last_activity = now
-
-                        if auth_state != "ok":
-                            publish_auth_state(mqtt_client, "ok")
-                            auth_state = "ok"
-
-                        # Force a publish so updated_at stays fresh.
-                        reservation_payload = None
-
-                        next_meta_refresh = (
-                            next_metadata_refresh(now)
-                        )
-
-                        logging.info(
-                            "Metadata refreshed: %s, "
-                            "reservations %d. "
-                            "Next refresh: %s",
-                            shop,
-                            len(reservations),
-                            next_meta_refresh.strftime(
-                                "%d.%m.%Y %H:%M"
-                            ),
-                        )
-
-                    elif keepalive_due(last_activity, now):
-                        get_page_text(page, RESERVATIONS_URL)
-                        context.storage_state(
-                            path=str(AUTH_STATE_FILE)
-                        )
-                        last_activity = now
-                        logging.info("Keepalive ok")
-
-                    new_reservation_payload = build_reservation_payload(
+                if (
+                    shop is None
+                    or next_meta_refresh is None
+                    or now >= next_meta_refresh
+                ):
+                    (
                         shop,
                         reservations,
                         opening_hours,
-                        now,
+                    ) = refresh_metadata(client)
+
+                    client.save()
+
+                    last_activity = now
+
+                    if auth_state != "ok":
+                        publish_auth_state(mqtt_client, "ok")
+                        auth_state = "ok"
+
+                    # Force a publish so updated_at stays fresh.
+                    reservation_payload = None
+
+                    next_meta_refresh = (
+                        next_metadata_refresh(now)
                     )
 
-                    if reservation_payload_changed(
-                        reservation_payload,
+                    logging.info(
+                        "Metadata refreshed: %s, "
+                        "reservations %d. "
+                        "Next refresh: %s",
+                        shop,
+                        len(reservations),
+                        next_meta_refresh.strftime(
+                            "%d.%m.%Y %H:%M"
+                        ),
+                    )
+
+                elif keepalive_due(last_activity, now):
+                    client.page("myreservations")
+                    client.save()
+                    last_activity = now
+                    logging.info("Keepalive ok")
+
+                new_reservation_payload = build_reservation_payload(
+                    shop,
+                    reservations,
+                    opening_hours,
+                    now,
+                )
+
+                if reservation_payload_changed(
+                    reservation_payload,
+                    new_reservation_payload,
+                ):
+                    mqtt_publish_json(
+                        mqtt_client,
+                        MQTT_RESERVATION_TOPIC,
                         new_reservation_payload,
-                    ):
-                        mqtt_publish_json(
-                            mqtt_client,
-                            MQTT_RESERVATION_TOPIC,
-                            new_reservation_payload,
-                            retain=True,
-                        )
-                        reservation_payload = new_reservation_payload
-
-                    active = find_active_reservation(
-                        reservations,
-                        now.date(),
+                        retain=True,
                     )
+                    reservation_payload = new_reservation_payload
 
-                    open_now = is_open(
+                active = find_active_reservation(
+                    reservations,
+                    now.date(),
+                )
+
+                open_now = is_open(
+                    opening_hours,
+                    now,
+                )
+
+                final_read = bool(
+                    active
+                    and not open_now
+                    and final_read_due(
                         opening_hours,
                         now,
+                        final_read_done_for,
                     )
-
-                    final_read = bool(
-                        active
-                        and not open_now
-                        and final_read_due(
-                            opening_hours,
-                            now,
-                            final_read_done_for,
-                        )
-                    )
-
-                    if active and (open_now or final_read):
-                        logging.info(
-                            "Active reservation and %s -> reading sales",
-                            "shop open" if open_now else "final read after closing",
-                        )
-
-                        balance, sales = read_sales(
-                            page
-                        )
-
-                        context.storage_state(
-                            path=str(AUTH_STATE_FILE)
-                        )
-                        last_activity = now
-
-                        process_sales_change(
-                            mqtt_client,
-                            shop or "Kirppari-Kalle",
-                            active,
-                            balance,
-                            sales,
-                            now,
-                        )
-
-                        if final_read:
-                            final_read_done_for = now.date()
-
-                    else:
-                        logging.info(
-                            "No sales read: "
-                            "reservation=%s, open=%s",
-                            "yes" if active else "no",
-                            "yes" if open_now else "no",
-                        )
-
-                    consecutive_failures = 0
-
-                except AuthExpired as exc:
-                    logging.error("%s", exc)
-
-                    attempt_at = datetime.now(TZ)
-
-                    if relogin_allowed(load_last_login_attempt(), attempt_at):
-                        logging.info("Yritetään automaattista uudelleenkirjautumista")
-                        save_last_login_attempt(attempt_at)
-
-                        try:
-                            login(page)
-                            context.storage_state(
-                                path=str(AUTH_STATE_FILE)
-                            )
-                        except (LoginFailed, AuthExpired) as login_exc:
-                            logging.error(
-                                "Automaattinen kirjautuminen epäonnistui: %s",
-                                login_exc,
-                            )
-                        except Exception as login_exc:
-                            # Playwright messages are not logged in full.
-                            logging.error(
-                                "Automaattinen kirjautuminen epäonnistui: %s",
-                                type(login_exc).__name__,
-                            )
-                        else:
-                            logging.info("Automaattinen kirjautuminen onnistui")
-                            last_activity = attempt_at
-                            next_meta_refresh = None
-                            continue
-
-                    elif KK_USERNAME and KK_PASSWORD:
-                        logging.info(
-                            "Automaattista kirjautumista yritetty alle %s h sitten; "
-                            "ei yritetä nyt",
-                            f"{RELOGIN_MIN_INTERVAL_HOURS:g}",
-                        )
-
-                    try:
-                        publish_auth_state(mqtt_client, "expired")
-                    except Exception:
-                        logging.exception("Auth-tilan julkaisu epäonnistui")
-
-                    return 2
-
-                except Exception:
-                    consecutive_failures += 1
-
-                    logging.exception(
-                        "Monitoring cycle failed (%d/%d)",
-                        consecutive_failures,
-                        MAX_CONSECUTIVE_FAILURES,
-                    )
-
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        logging.error(
-                            "Liian monta peräkkäistä virhettä, "
-                            "lopetetaan (systemd käynnistää uudelleen)"
-                        )
-
-                        return 1
-
-                STOP_EVENT.wait(POLL_SECONDS)
-
-            logging.info("Stop requested")
-
-            try:
-                context.storage_state(
-                    path=str(AUTH_STATE_FILE)
                 )
-            except Exception:
-                pass
 
-            browser.close()
+                if active and (open_now or final_read):
+                    logging.info(
+                        "Active reservation and %s -> reading sales",
+                        "shop open" if open_now else "final read after closing",
+                    )
+
+                    balance, sales, data_updated = read_sales(
+                        client
+                    )
+
+                    client.save()
+                    last_activity = now
+
+                    process_sales_change(
+                        mqtt_client,
+                        shop or "Kirppari-Kalle",
+                        active,
+                        balance,
+                        sales,
+                        now,
+                        data_updated,
+                    )
+
+                    if final_read:
+                        final_read_done_for = now.date()
+
+                else:
+                    logging.info(
+                        "No sales read: "
+                        "reservation=%s, open=%s",
+                        "yes" if active else "no",
+                        "yes" if open_now else "no",
+                    )
+
+                consecutive_failures = 0
+
+            except AuthExpired as exc:
+                logging.error("%s", exc)
+
+                if attempt_login(client):
+                    last_activity = datetime.now(TZ)
+                    next_meta_refresh = None
+                    continue
+
+                try:
+                    publish_auth_state(mqtt_client, "expired")
+                except Exception:
+                    logging.exception("Auth-tilan julkaisu epäonnistui")
+
+                return 2
+
+            except Exception:
+                consecutive_failures += 1
+
+                logging.exception(
+                    "Monitoring cycle failed (%d/%d)",
+                    consecutive_failures,
+                    MAX_CONSECUTIVE_FAILURES,
+                )
+
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logging.error(
+                        "Liian monta peräkkäistä virhettä, "
+                        "lopetetaan (systemd käynnistää uudelleen)"
+                    )
+
+                    return 1
+
+            STOP_EVENT.wait(POLL_SECONDS)
+
+        logging.info("Stop requested")
+
+        try:
+            client.save()
+        except Exception:
+            pass
 
     except Exception:
         logging.exception(
